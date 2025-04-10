@@ -882,6 +882,11 @@ void* gfx_opengl_get_framebuffer_texture_id(int fb_id) {
     return (void*)(uintptr_t)framebuffers[fb_id].clrbuf;
 }
 
+static void* gfx_opengl_get_framebuffer_texture_ptr(int framebuffer_id) {
+    //used for vr support, not used with opengl
+    return nullptr;
+}
+
 void gfx_opengl_select_texture_fb(int fb_id) {
     // glDisable(GL_DEPTH_TEST);
     glActiveTexture(GL_TEXTURE0 + 0);
@@ -1078,6 +1083,7 @@ struct GfxRenderingAPI gfx_opengl_api = { gfx_opengl_get_name,
                                           gfx_opengl_resolve_msaa_color_buffer,
                                           gfx_opengl_get_pixel_depth,
                                           gfx_opengl_get_framebuffer_texture_id,
+                                          gfx_opengl_get_framebuffer_texture_ptr,
                                           gfx_opengl_select_texture_fb,
                                           gfx_opengl_delete_texture,
                                           gfx_opengl_set_texture_filter,

@@ -189,6 +189,9 @@ if (GFX_DEBUG_DISASSEMBLER)
     target_link_libraries(libultraship PRIVATE libgfxd)
 endif()
 
+find_package(glm CONFIG REQUIRED)
+target_link_libraries(libultraship PUBLIC glm::glm)
+
 find_package(libzip REQUIRED)
 target_link_libraries(libultraship PRIVATE libzip::zip)
 
@@ -337,3 +340,16 @@ if ("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU|Clang")
     )
     endif()
 endif()
+
+target_link_libraries(libultraship PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../external/openvr/lib/win64/openvr_api.lib"
+)
+
+target_include_directories(libultraship PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/../external/openvr/headers"
+)
+
+add_custom_command(TARGET libultraship POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/../external/openvr/bin/win64/openvr_api.dll"
+    "$<TARGET_FILE_DIR:libultraship>")

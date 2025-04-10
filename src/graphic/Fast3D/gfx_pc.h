@@ -243,6 +243,12 @@ void gfx_destroy();
 struct GfxRenderingAPI* gfx_get_current_rendering_api();
 void gfx_start_frame();
 
+//VR Functions
+void vr_init();
+void vr_get_poses();
+void vr_update_view_matrix(int eye);
+void vr_submit_framebuffers();
+
 // Since this function is "exposted" to the games, it needs to take a normal Gfx
 void gfx_run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
 void gfx_handle_window_events();

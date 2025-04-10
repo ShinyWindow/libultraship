@@ -66,6 +66,7 @@ struct GfxRenderingAPI {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> (*get_pixel_depth)(
         int fb_id, const std::set<std::pair<float, float>>& coordinates);
     void* (*get_framebuffer_texture_id)(int fb_id);
+    void* (*get_framebuffer_texture_ptr)(int fb_id);
     void (*select_texture_fb)(int fb_id);
     void (*delete_texture)(uint32_t texID);
     void (*set_texture_filter)(FilteringMode mode);

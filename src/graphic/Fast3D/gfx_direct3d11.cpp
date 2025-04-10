@@ -972,6 +972,27 @@ void* gfx_d3d11_get_framebuffer_texture_id(int fb_id) {
     return (void*)d3d.textures[d3d.framebuffers[fb_id].texture_id].resource_view.Get();
 }
 
+static void* gfx_d3d11_get_framebuffer_texture_ptr(int fb_id) {
+    if (fb_id < 0 || fb_id >= static_cast<int>(d3d.framebuffers.size())) {
+        SPDLOG_ERROR("Invalid framebuffer ID: {}", fb_id);
+        return nullptr;
+    }
+
+    const auto& fb = d3d.framebuffers[fb_id];
+    if (fb.texture_id < 0 || fb.texture_id >= static_cast<int>(d3d.textures.size())) {
+        SPDLOG_ERROR("Invalid texture ID {} for framebuffer {}", fb.texture_id, fb_id);
+        return nullptr;
+    }
+
+    auto* tex = d3d.textures[fb.texture_id].texture.Get();
+
+    if (!tex) {
+        SPDLOG_ERROR("Texture pointer for framebuffer {} (tex id {}) is null", fb_id, fb.texture_id);
+    }
+
+    return (void*)tex;
+}
+
 void gfx_d3d11_select_texture_fb(int fbID) {
     int tile = 0;
     gfx_d3d11_select_texture(tile, d3d.framebuffers[fbID].texture_id);
@@ -1272,6 +1293,7 @@ struct GfxRenderingAPI gfx_direct3d11_api = { gfx_d3d11_get_name,
                                               gfx_d3d11_resolve_msaa_color_buffer,
                                               gfx_d3d11_get_pixel_depth,
                                               gfx_d3d11_get_framebuffer_texture_id,
+                                              gfx_d3d11_get_framebuffer_texture_ptr,
                                               gfx_d3d11_select_texture_fb,
                                               gfx_d3d11_delete_texture,
                                               gfx_d3d11_set_texture_filter,

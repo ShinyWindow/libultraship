@@ -82,6 +82,7 @@ void Fast3dWindow::Init() {
 
     InitWindowManager();
 
+    vr_init();
     gfx_init(mWindowManagerApi, mRenderingApi, Ship::Context::GetInstance()->GetName().c_str(), isFullscreen, width,
              height, posX, posY);
     mWindowManagerApi->set_fullscreen_changed_callback(OnFullscreenChanged);
@@ -172,14 +173,21 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     }
 
     auto gui = wnd->GetGui();
-    // Setup of the backend frames and draw initial Window and GUI menus
-    gui->StartDraw();
-    // Setup game framebuffers to match available window space
-    gfx_start_frame();
-    // Execute the games gfx commands
-    gfx_run(commands, mtxReplacements);
-    // Renders the game frame buffer to the final window and finishes the GUI
-    gui->EndDraw();
+    vr_get_poses();
+    // Render twice, once for each eye
+    for (int i = 0; i < 2; i++) {
+        // Setup of the backend frames and draw initial Window and GUI menus
+        gui->StartDraw();
+        // Setup game framebuffers to match available window space
+        gfx_start_frame();
+        // Update view matrices for both eyes
+        vr_update_view_matrix(i);
+        // Execute the games gfx commands
+        gfx_run(commands, mtxReplacements);
+        // Renders the game frame buffer to the final window and finishes the GUI
+        gui->EndDraw();
+    }
+    vr_submit_framebuffers();
     // Finalize swap buffers
     gfx_end_frame();
 
