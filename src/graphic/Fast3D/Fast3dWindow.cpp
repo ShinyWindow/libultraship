@@ -9,7 +9,7 @@
 #include "graphic/Fast3D/gfx_metal.h"
 #include "graphic/Fast3D/gfx_direct3d11.h"
 #include "graphic/Fast3D/gfx_direct3d12.h"
-#include "graphic/Fast3D/gfx_pc.h"
+#include "graphic/Fast3D/vr_openxr.h"
 
 #include <fstream>
 
@@ -38,6 +38,7 @@ Fast3dWindow::Fast3dWindow() : Fast3dWindow(std::vector<std::shared_ptr<Ship::Gu
 
 Fast3dWindow::~Fast3dWindow() {
     SPDLOG_DEBUG("destruct fast3dwindow");
+    vr_shutdown();
     gfx_destroy();
 }
 
@@ -82,9 +83,9 @@ void Fast3dWindow::Init() {
 
     InitWindowManager();
 
-    vr_init();
     gfx_init(mWindowManagerApi, mRenderingApi, Ship::Context::GetInstance()->GetName().c_str(), isFullscreen, width,
              height, posX, posY);
+    vr_init(); // Must be after gfx_init — needs D3D11 device to exist
     mWindowManagerApi->set_fullscreen_changed_callback(OnFullscreenChanged);
     mWindowManagerApi->set_keyboard_callbacks(KeyDown, KeyUp, AllKeysUp);
     mWindowManagerApi->set_mouse_callbacks(MouseButtonDown, MouseButtonUp);
@@ -167,28 +168,36 @@ bool Fast3dWindow::IsFrameReady() {
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
     std::shared_ptr<Window> wnd = Ship::Context::GetInstance()->GetWindow();
 
-    // Skip dropped frames
     if (!wnd->IsFrameReady()) {
         return false;
     }
 
     auto gui = wnd->GetGui();
-    vr_get_poses();
-    // Render twice, once for each eye
-    for (int i = 0; i < 2; i++) {
-        // Setup of the backend frames and draw initial Window and GUI menus
-        gui->StartDraw();
-        // Setup game framebuffers to match available window space
+    gui->StartDraw();
+
+    if (vr_is_initialized()) {
+        if (!vr_begin_frame()) {
+            // Runtime says don't render (or session not ready)
+            gui->EndDraw();
+            gfx_end_frame();
+            return true;
+        }
+
+        for (int eye = 0; eye < 2; eye++) {
+            vr_begin_eye(eye);
+            gfx_start_frame();
+            gfx_run(commands, mtxReplacements);
+            vr_end_eye(eye);
+        }
+
+        vr_end_frame();
+    } else {
+        // Non-VR path
         gfx_start_frame();
-        // Update view matrices for both eyes
-        vr_update_view_matrix(i);
-        // Execute the games gfx commands
         gfx_run(commands, mtxReplacements);
-        // Renders the game frame buffer to the final window and finishes the GUI
-        gui->EndDraw();
     }
-    vr_submit_framebuffers();
-    // Finalize swap buffers
+
+    gui->EndDraw();
     gfx_end_frame();
 
     return true;

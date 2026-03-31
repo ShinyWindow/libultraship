@@ -23,14 +23,9 @@
 #include "libultraship/libultra/types.h"
 // #include "libultraship/libultra/gs2dex.h"
 #include <string>
-#include <openvr.h>
-#include <d3d11.h>
-
-#include <glm/glm.hpp>
-#include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/type_ptr.hpp>
 
 #include "gfx_pc.h"
+#include "vr_openxr.h"
 #include "gfx_cc.h"
 #include "lus_gbi.h"
 #include "gfx_window_manager_api.h"
@@ -46,7 +41,6 @@
 
 #include <spdlog/fmt/fmt.h>
 
-#include "vr_system_internal.h"
 
 
 uintptr_t gfxFramebuffer;
@@ -119,12 +113,6 @@ struct XYWidthHeight gfx_prev_native_dimensions;
 static bool game_renders_to_framebuffer;
 static int game_framebuffer;
 static int game_framebuffer_msaa_resolved;
-
-static VRSystem vr_system = {};
-
-VRSystem* GetVRSystem() {
-    return &vr_system;
-}
 
 uint32_t gfx_msaa_level = 1;
 
@@ -1181,19 +1169,21 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
     const int8_t mtx_push = get_attr(MTX_PUSH);
 
     if (parameters & mtx_projection) {
-        if (vr_system.initialized) {
-            glm::mat4 projection =
-                glm::make_mat4(&vr_system.eye_projection_matrices_converted[vr_system.current_eye][0][0]);
-            glm::mat4 view = glm::make_mat4(&vr_system.eye_view_matrices[vr_system.current_eye][0][0]);
-            glm::mat4 vp = projection * view;
-
-            memcpy(g_rsp.P_matrix, glm::value_ptr(vp), sizeof(g_rsp.P_matrix));
+        if (vr_is_initialized()) {
+            // Replace game projection with VR projection * view.
+            // Row-vector convention: v_clip = v * MV * P, so P = VR_view * VR_projection.
+            float vr_proj[4][4], vr_view[4][4];
+            vr_get_projection_matrix(vr_get_current_eye(), vr_proj);
+            vr_get_view_matrix(vr_get_current_eye(), vr_view);
+            gfx_matrix_mul(g_rsp.P_matrix, vr_view, vr_proj);
+            // Game projection is discarded — do not load or multiply it.
+        } else {
+            if (parameters & mtx_load) {
+                memcpy(g_rsp.P_matrix, matrix, sizeof(matrix));
+            } else {
+                gfx_matrix_mul(g_rsp.P_matrix, matrix, g_rsp.P_matrix);
+            }
         }
-        // if (parameters & mtx_load) {
-        //     memcpy(g_rsp.P_matrix, matrix, sizeof(matrix));
-        // } else {
-        gfx_matrix_mul(g_rsp.P_matrix, matrix, g_rsp.P_matrix);
-        // }
     } else { // G_MTX_MODELVIEW
         if ((parameters & mtx_push) && g_rsp.modelview_matrix_stack_size < 11) {
             ++g_rsp.modelview_matrix_stack_size;
@@ -1228,7 +1218,7 @@ static void gfx_sp_pop_matrix(uint32_t count) {
 }
 
 static float gfx_adjust_x_for_aspect_ratio(float x) {
-    if (fbActive) {
+    if (fbActive || vr_is_initialized()) {
         return x;
     } else {
         return x * (4.0f / 3.0f) / ((float)gfx_current_dimensions.width / (float)gfx_current_dimensions.height);
@@ -3524,8 +3514,12 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
     gfx_flush();
     fbActive = false;
     active_fb = framebuffers.end();
-    gfx_rapi->start_draw_to_framebuffer(game_renders_to_framebuffer ? game_framebuffer : 0,
-                                        (float)gfx_current_dimensions.height / gfx_native_dimensions.height);
+    if (vr_is_initialized()) {
+        vr_rebind_current_eye_target();
+    } else {
+        gfx_rapi->start_draw_to_framebuffer(game_renders_to_framebuffer ? game_framebuffer : 0,
+                                            (float)gfx_current_dimensions.height / gfx_native_dimensions.height);
+    }
     // Force viewport and scissor to reapply against the main framebuffer, in case a previous smaller
     // framebuffer truncated the values
     g_rdp.viewport_or_scissor_changed = true;
@@ -4182,149 +4176,8 @@ static void gfx_sp_reset() {
     calculate_normal_dir(&g_rsp.lookat[1], g_rsp.current_lookat_coeffs[1]);
 }
 
-void convert_openvr_matrix_to_engine(const vr::HmdMatrix44_t& vrMatrix, float out[4][4]) {
-    for (int row = 0; row < 4; ++row) {
-        for (int col = 0; col < 4; ++col) {
-            out[row][col] = vrMatrix.m[col][row]; // Transpose to row-major
-        }
-    }
-}
-
-glm::mat4 convert_openvr_matrix34_to_glm(const vr::HmdMatrix34_t& mat) {
-    glm::mat4 result = glm::mat4(1.0f);
-
-    result[0][0] = mat.m[0][0];
-    result[1][0] = mat.m[0][1];
-    result[2][0] = mat.m[0][2];
-    result[3][0] = mat.m[0][3];
-    result[0][1] = mat.m[1][0];
-    result[1][1] = mat.m[1][1];
-    result[2][1] = mat.m[1][2];
-    result[3][1] = mat.m[1][3];
-    result[0][2] = mat.m[2][0];
-    result[1][2] = mat.m[2][1];
-    result[2][2] = mat.m[2][2];
-    result[3][2] = mat.m[2][3];
-    result[0][3] = 0.0f;
-    result[1][3] = 0.0f;
-    result[2][3] = 0.0f;
-    result[3][3] = 1.0f;
-
-    return result;
-}
-
 void gfx_get_dimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
     gfx_wapi->get_dimensions(width, height, posX, posY);
-}
-
-void vr_init() {
-    // initialize openvr
-    vr::EVRInitError eError = vr::VRInitError_None;
-    vr_system.system = vr::VR_Init(&eError, vr::VRApplication_Scene);
-
-    if (eError != vr::VRInitError_None) {
-        char error_msg[1024];
-        sprintf_s(error_msg, sizeof(error_msg), "Unable to init VR runtime: %s",
-                  vr::VR_GetVRInitErrorAsEnglishDescription(eError));
-        return;
-    }
-
-    vr_system.compositor = vr::VRCompositor();
-    vr_system.render_models = vr::VRRenderModels();
-
-    // Get recommended render target size
-    // vr_system.system->GetRecommendedRenderTargetSize(&vr_system.render_width, &vr_system.render_height);
-    // SPDLOG_INFO("initial Width = {}, Height = {}", vr_system.render_width, vr_system.render_height);
-
-    // william
-    //  Set near/far planes
-    float nearClip = 10.0f;
-    float farClip = 10000.0f;
-
-    // Fetch both eye-to-head transforms
-    vr_system.eye_positions[vr::Eye_Left] = vr_system.system->GetEyeToHeadTransform(vr::Eye_Left);
-    vr_system.eye_positions[vr::Eye_Right] = vr_system.system->GetEyeToHeadTransform(vr::Eye_Right);
-
-    // Fetch both projection matrices
-    convert_openvr_matrix_to_engine(vr_system.system->GetProjectionMatrix(vr::Eye_Left, nearClip, farClip),
-                                    vr_system.eye_projection_matrices_converted[vr::Eye_Left]);
-
-    convert_openvr_matrix_to_engine(vr_system.system->GetProjectionMatrix(vr::Eye_Right, nearClip, farClip),
-                                    vr_system.eye_projection_matrices_converted[vr::Eye_Right]);
-
-    vr::HmdMatrix44_t mat = vr_system.system->GetProjectionMatrix(vr::Eye_Left, nearClip, farClip);
-    spdlog::info("OpenVR Projection Matrix (Left Eye):");
-    for (int r = 0; r < 4; ++r) {
-        spdlog::info("{:.5f}  {:.5f}  {:.5f}  {:.5f}", mat.m[r][0], mat.m[r][1], mat.m[r][2], mat.m[r][3]);
-    }
-
-    vr_system.initialized = true;
-}
-
-void vr_get_poses() {
-    vr::VRCompositor()->WaitGetPoses(vr_system.tracked_device_poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
-}
-
-void vr_update_view_matrix(int eye) {
-    vr_system.current_eye = eye;
-    if (vr_system.initialized) {
-        if (!vr_system.tracked_device_poses[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid) {
-            fprintf(stderr, "[VR] HMD pose not valid! Skipping view matrix update.\n");
-            return;
-        }
-
-        const vr::HmdMatrix34_t& head_pose_raw =
-            vr_system.tracked_device_poses[vr::k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking;
-        glm::mat4 head_pose = convert_openvr_matrix34_to_glm(head_pose_raw);
-        vr::HmdMatrix34_t raw_eye = vr_system.eye_positions[static_cast<vr::EVREye>(vr_system.current_eye)];
-        glm::mat4 eye_to_head = convert_openvr_matrix34_to_glm(raw_eye);
-
-        glm::mat4 eye_pose = head_pose * eye_to_head;
-
-        // Invert eye pose with tracking origin for final view matrix
-        glm::mat4 view = glm::inverse(eye_pose);
-
-        memcpy(vr_system.eye_view_matrices[static_cast<vr::EVREye>(vr_system.current_eye)], glm::value_ptr(view),
-               sizeof(float) * 16);
-    }
-}
-
-ID3D11Texture2D* GetVRTextureForEye(int fb_id) {
-
-    ID3D11Texture2D* texture = reinterpret_cast<ID3D11Texture2D*>(gfx_rapi->get_framebuffer_texture_ptr(fb_id));
-
-    if (!texture) {
-        spdlog::error("Failed to retrieve Direct3D texture for eye {} with framebuffer ID {}", vr_system.current_eye,
-                      fb_id);
-    } else {
-        // spdlog::info("Got valid texture pointer for eye {}: {}", vr_system.current_eye,
-        //              static_cast<void*>(texture));
-    }
-
-    return texture;
-}
-
-void vr_submit_framebuffers() {
-    for (int i = 0; i < 2; i++) {
-        // Eye eye = static_cast<Eye>(i);
-        ID3D11Texture2D* tex = GetVRTextureForEye(i);
-
-        if (!tex) {
-            spdlog::warn("Skipping submission for eye {}: texture is null", i);
-            continue;
-        }
-
-        vr::Texture_t vrTex = { tex, vr::TextureType_DirectX, vr::ColorSpace_Gamma };
-        vr::EVREye vrEye = static_cast<vr::EVREye>(i);
-
-        vr::EVRCompositorError error = vr_system.compositor->Submit(vrEye, &vrTex);
-        if (error != vr::VRCompositorError_None) {
-            spdlog::error("OpenVR Submit failed for eye {}: error code {}", i, static_cast<int>(error));
-
-        } else {
-            // spdlog::info("Successfully submitted texture for eye {}", i);
-        }
-    }
 }
 
 void gfx_init(struct GfxWindowManagerAPI* wapi, struct GfxRenderingAPI* rapi, const char* game_name,
@@ -4342,9 +4195,6 @@ void gfx_init(struct GfxWindowManagerAPI* wapi, struct GfxRenderingAPI* rapi, co
 
     game_framebuffer = gfx_rapi->create_framebuffer();
     game_framebuffer_msaa_resolved = gfx_rapi->create_framebuffer();
-
-    // Setup secondary framebuffer for vr
-    gfx_rapi->update_framebuffer_parameters(game_framebuffer, width, height, 1, false, true, true, true);
 
     gfx_native_dimensions.width = SCREEN_WIDTH;
     gfx_native_dimensions.height = SCREEN_HEIGHT;
@@ -4403,6 +4253,21 @@ bool viewport_matches_render_resolution() {
 void gfx_start_frame() {
     gfx_wapi->get_dimensions(&gfx_current_window_dimensions.width, &gfx_current_window_dimensions.height,
                              &gfx_current_window_position_x, &gfx_current_window_position_y);
+
+    if (vr_is_initialized()) {
+        // In VR, use HMD resolution instead of window resolution
+        uint32_t vr_w, vr_h;
+        vr_get_recommended_resolution(&vr_w, &vr_h);
+        gfx_current_dimensions.width = vr_w;
+        gfx_current_dimensions.height = vr_h;
+        gfx_current_dimensions.aspect_ratio = (float)vr_w / (float)vr_h;
+        gfx_current_window_dimensions.width = vr_w;
+        gfx_current_window_dimensions.height = vr_h;
+        game_renders_to_framebuffer = false;
+        fbActive = 0;
+        return;
+    }
+
     if (gfx_current_dimensions.height == 0) {
         // Avoid division by zero
         gfx_current_dimensions.height = 1;
@@ -4457,10 +4322,8 @@ void gfx_start_frame() {
 GfxExecStack g_exec_stack = {};
 
 void gfx_run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
-    int currentFramebuffer = 0;
-    if(vr_system.initialized){
-        currentFramebuffer = vr_system.current_eye;
-    }
+    bool vr_active = vr_is_initialized();
+
     gfx_sp_reset();
 
     get_pixel_depth_pending.clear();
@@ -4468,13 +4331,20 @@ void gfx_run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacemen
 
     current_mtx_replacements = &mtx_replacements;
 
-    gfx_rapi->update_framebuffer_parameters(currentFramebuffer, gfx_current_window_dimensions.width,
-                                            gfx_current_window_dimensions.height, 1, false, true, true,
-                                            !game_renders_to_framebuffer);
+    if (!vr_active) {
+        // Non-VR: set up engine framebuffer as render target
+        gfx_rapi->update_framebuffer_parameters(0, gfx_current_window_dimensions.width,
+                                                gfx_current_window_dimensions.height, 1, false, true, true,
+                                                !game_renders_to_framebuffer);
+    }
     gfx_rapi->start_frame();
-    gfx_rapi->start_draw_to_framebuffer(game_renders_to_framebuffer ? game_framebuffer : currentFramebuffer,
-                                        (float)gfx_current_dimensions.height / gfx_native_dimensions.height);
-    gfx_rapi->clear_framebuffer(false, true);
+    if (!vr_active) {
+        gfx_rapi->start_draw_to_framebuffer(game_renders_to_framebuffer ? game_framebuffer : 0,
+                                            (float)gfx_current_dimensions.height / gfx_native_dimensions.height);
+        gfx_rapi->clear_framebuffer(false, true);
+    }
+    // VR: render target already bound by vr_begin_eye()
+
     g_rdp.viewport_or_scissor_changed = true;
     rendering_state.viewport = {};
     rendering_state.scissor = {};
@@ -4487,13 +4357,14 @@ void gfx_run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacemen
         if (dbg->IsDebugging()) {
             g_exec_stack.gfx_path.push_back(cmd);
             if (dbg->HasBreakPoint(g_exec_stack.gfx_path)) {
-                // On a breakpoint with the active framebuffer still set, we need to reset back to prevent
-                // soft locking the renderer
                 if (fbActive) {
                     fbActive = 0;
-                    gfx_rapi->start_draw_to_framebuffer(game_renders_to_framebuffer ? game_framebuffer : currentFramebuffer, 1);
+                    if (vr_active) {
+                        vr_rebind_current_eye_target();
+                    } else {
+                        gfx_rapi->start_draw_to_framebuffer(game_renders_to_framebuffer ? game_framebuffer : 0, 1);
+                    }
                 }
-
                 break;
             }
             g_exec_stack.gfx_path.pop_back();
@@ -4505,27 +4376,29 @@ void gfx_run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacemen
     gfxFramebuffer = 0;
     currentDir = std::stack<std::string>();
 
-    if (game_renders_to_framebuffer) {
-        gfx_rapi->start_draw_to_framebuffer(0, 1);
-        gfx_rapi->clear_framebuffer(true, true);
+    if (!vr_active) {
+        // Non-VR: blit from game framebuffer to window if needed
+        if (game_renders_to_framebuffer) {
+            gfx_rapi->start_draw_to_framebuffer(0, 1);
+            gfx_rapi->clear_framebuffer(true, true);
 
-        if (gfx_msaa_level > 1) {
-            if (!viewport_matches_render_resolution()) {
-                gfx_rapi->resolve_msaa_color_buffer(game_framebuffer_msaa_resolved, game_framebuffer);
-                gfxFramebuffer = (uintptr_t)gfx_rapi->get_framebuffer_texture_id(game_framebuffer_msaa_resolved);
+            if (gfx_msaa_level > 1) {
+                if (!viewport_matches_render_resolution()) {
+                    gfx_rapi->resolve_msaa_color_buffer(game_framebuffer_msaa_resolved, game_framebuffer);
+                    gfxFramebuffer = (uintptr_t)gfx_rapi->get_framebuffer_texture_id(game_framebuffer_msaa_resolved);
+                } else {
+                    gfx_rapi->resolve_msaa_color_buffer(0, game_framebuffer);
+                }
             } else {
-                gfx_rapi->resolve_msaa_color_buffer(0, game_framebuffer);
+                gfxFramebuffer = (uintptr_t)gfx_rapi->get_framebuffer_texture_id(game_framebuffer);
             }
-        } else {
-            gfxFramebuffer = (uintptr_t)gfx_rapi->get_framebuffer_texture_id(game_framebuffer);
+        } else if (fbActive) {
+            fbActive = 0;
+            gfx_rapi->start_draw_to_framebuffer(0, 1);
+            assert(0 && "active framebuffer was never reset back to original");
         }
-    } else if (fbActive) {
-        // Failsafe reset to main framebuffer to prevent softlocking the renderer
-        fbActive = 0;
-        gfx_rapi->start_draw_to_framebuffer(0, 1);
-
-        assert(0 && "active framebuffer was never reset back to original");
     }
+    // VR: swapchain image released by vr_end_eye() in the caller
 }
 
 void gfx_end_frame() {
@@ -4612,7 +4485,11 @@ void gfx_copy_framebuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* has
 }
 
 void gfx_reset_framebuffer() {
-    gfx_rapi->start_draw_to_framebuffer(0, (float)gfx_current_dimensions.height / gfx_native_dimensions.height);
+    if (vr_is_initialized()) {
+        vr_rebind_current_eye_target();
+    } else {
+        gfx_rapi->start_draw_to_framebuffer(0, (float)gfx_current_dimensions.height / gfx_native_dimensions.height);
+    }
 }
 
 static void adjust_pixel_depth_coordinates(float& x, float& y) {
