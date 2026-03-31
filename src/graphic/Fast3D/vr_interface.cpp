@@ -7,4 +7,8 @@ bool VR_IsInitialized() {
     return vr_is_initialized();
 }
 
+void VR_SetOverlayDisplayList(void* commands) {
+    vr_set_hud_commands(commands);
+}
+
 }

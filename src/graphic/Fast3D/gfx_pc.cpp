@@ -1169,14 +1169,46 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
     const int8_t mtx_push = get_attr(MTX_PUSH);
 
     if (parameters & mtx_projection) {
-        if (vr_is_initialized()) {
-            // Replace game projection with VR projection * view.
-            // Row-vector convention: v_clip = v * MV * P, so P = VR_view * VR_projection.
-            float vr_proj[4][4], vr_view[4][4];
-            vr_get_projection_matrix(vr_get_current_eye(), vr_proj);
-            vr_get_view_matrix(vr_get_current_eye(), vr_view);
-            gfx_matrix_mul(g_rsp.P_matrix, vr_view, vr_proj);
-            // Game projection is discarded — do not load or multiply it.
+        if (vr_is_initialized() && !vr_is_rendering_hud()) {
+            if (parameters & mtx_load) {
+                // LOAD: replace game's perspective with VR view + projection.
+                float vr_proj[4][4], vr_view[4][4];
+                vr_get_projection_matrix(vr_get_current_eye(), vr_proj);
+                vr_get_view_matrix(vr_get_current_eye(), vr_view);
+                gfx_matrix_mul(g_rsp.P_matrix, vr_view, vr_proj);
+            } else {
+                // MULTIPLY: game is sending its lookAt (camera view) matrix.
+                //
+                // === CAMERA FOLLOW MODE ===
+                // Option A: Follow game camera position AND rotation (uncommented below).
+                //           VR headset adds additional rotation on top of the game camera.
+                // Option B: Follow game camera position ONLY, rotation from VR headset only.
+                //           To switch to Option B, comment out Option A and uncomment Option B.
+
+                // --- Option A: Full lookAt (position + rotation from game) ---
+                gfx_matrix_mul(g_rsp.P_matrix, matrix, g_rsp.P_matrix);
+
+                // --- Option B: Position only (rotation from VR headset only) ---
+                // Extract camera world position, discard its rotation.
+                // Row-vector lookAt: rotation in upper 3x3, translation in row 3.
+                // t = row 3 = -eye * R, so eye = -(t * R^T) = -(t dotted with each ROW of R).
+                //
+                // float t0 = matrix[3][0], t1 = matrix[3][1], t2 = matrix[3][2];
+                // float ex = -(t0 * matrix[0][0] + t1 * matrix[0][1] + t2 * matrix[0][2]);
+                // float ey = -(t0 * matrix[1][0] + t1 * matrix[1][1] + t2 * matrix[1][2]);
+                // float ez = -(t0 * matrix[2][0] + t1 * matrix[2][1] + t2 * matrix[2][2]);
+                //
+                // float cam_translate[4][4] = {};
+                // cam_translate[0][0] = 1.0f;
+                // cam_translate[1][1] = 1.0f;
+                // cam_translate[2][2] = 1.0f;
+                // cam_translate[3][3] = 1.0f;
+                // cam_translate[3][0] = -ex;
+                // cam_translate[3][1] = -ey;
+                // cam_translate[3][2] = -ez;
+                //
+                // gfx_matrix_mul(g_rsp.P_matrix, cam_translate, g_rsp.P_matrix);
+            }
         } else {
             if (parameters & mtx_load) {
                 memcpy(g_rsp.P_matrix, matrix, sizeof(matrix));
@@ -1218,7 +1250,7 @@ static void gfx_sp_pop_matrix(uint32_t count) {
 }
 
 static float gfx_adjust_x_for_aspect_ratio(float x) {
-    if (fbActive || vr_is_initialized()) {
+    if (fbActive || (vr_is_initialized() && !vr_is_rendering_hud())) {
         return x;
     } else {
         return x * (4.0f / 3.0f) / ((float)gfx_current_dimensions.width / (float)gfx_current_dimensions.height);
@@ -1872,28 +1904,20 @@ static void gfx_sp_extra_geometry_mode(uint32_t clear, uint32_t set) {
 }
 
 static void gfx_adjust_viewport_or_scissor(XYWidthHeight* area) {
-    if (!fbActive) {
-        // Adjust the y origin based on the y-inversion for the active framebuffer
+    if (vr_is_initialized()) {
+        // VR renders directly to eye buffers — scale from native to VR resolution,
+        // but skip the desktop window viewport offset.
         GfxClipParameters clipParameters = gfx_rapi->get_clip_parameters();
         if (clipParameters.invert_y) {
             area->y -= area->height;
         } else {
             area->y = gfx_native_dimensions.height - area->y;
         }
-
         area->width *= RATIO_X;
         area->height *= RATIO_Y;
         area->x *= RATIO_X;
         area->y *= RATIO_Y;
-
-        if (!game_renders_to_framebuffer ||
-            (gfx_msaa_level > 1 && gfx_current_dimensions.width == gfx_current_game_window_viewport.width &&
-             gfx_current_dimensions.height == gfx_current_game_window_viewport.height)) {
-            area->x += gfx_current_game_window_viewport.x;
-            area->y += gfx_current_window_dimensions.height -
-                       (gfx_current_game_window_viewport.y + gfx_current_game_window_viewport.height);
-        }
-    } else {
+    } else if (!fbActive) {
         area->y = active_fb->second.orig_height - area->y;
 
         if (active_fb->second.resize) {
@@ -4255,9 +4279,13 @@ void gfx_start_frame() {
                              &gfx_current_window_position_x, &gfx_current_window_position_y);
 
     if (vr_is_initialized()) {
-        // In VR, use HMD resolution instead of window resolution
         uint32_t vr_w, vr_h;
-        vr_get_recommended_resolution(&vr_w, &vr_h);
+        if (vr_is_rendering_hud()) {
+            vr_w = 1024;
+            vr_h = 768;
+        } else {
+            vr_get_recommended_resolution(&vr_w, &vr_h);
+        }
         gfx_current_dimensions.width = vr_w;
         gfx_current_dimensions.height = vr_h;
         gfx_current_dimensions.aspect_ratio = (float)vr_w / (float)vr_h;

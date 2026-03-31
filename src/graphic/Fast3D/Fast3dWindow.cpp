@@ -190,6 +190,15 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
             vr_end_eye(eye);
         }
 
+        // Render HUD overlay to separate texture (once, not per-eye)
+        Gfx* hud_commands = static_cast<Gfx*>(vr_get_hud_commands());
+        if (hud_commands) {
+            vr_begin_hud();
+            gfx_start_frame();
+            gfx_run(hud_commands, mtxReplacements);
+            vr_end_hud();
+        }
+
         vr_end_frame();
     } else {
         // Non-VR path

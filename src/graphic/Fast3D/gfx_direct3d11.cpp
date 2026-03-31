@@ -1300,8 +1300,9 @@ struct GfxRenderingAPI gfx_direct3d11_api = { gfx_d3d11_get_name,
                                               gfx_d3d11_get_texture_filter,
                                               gfx_d3d11_enable_srgb_mode };
 
-// D3D11 device accessors for VR module
+// D3D11 accessors for VR module
 void* gfx_d3d11_get_device() { return d3d.device.Get(); }
 void* gfx_d3d11_get_context() { return d3d.context.Get(); }
+void gfx_d3d11_set_render_target_height(uint32_t height) { d3d.render_target_height = height; }
 
 #endif

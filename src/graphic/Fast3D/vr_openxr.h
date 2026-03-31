@@ -28,3 +28,10 @@ void vr_set_world_scale(float units_per_meter);
 
 // Render target rebind (called when sub-framebuffer operations restore the main target)
 void vr_rebind_current_eye_target();
+
+// HUD overlay (rendered to a separate quad layer in front of the user)
+void vr_set_hud_commands(void* commands);
+void* vr_get_hud_commands();
+void vr_begin_hud();
+void vr_end_hud();
+bool vr_is_rendering_hud();
