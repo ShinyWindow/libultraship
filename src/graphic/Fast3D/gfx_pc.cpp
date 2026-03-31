@@ -46,6 +46,9 @@
 
 #include <spdlog/fmt/fmt.h>
 
+#include "vr_system_internal.h"
+
+
 uintptr_t gfxFramebuffer;
 std::stack<std::string> currentDir;
 
@@ -117,20 +120,11 @@ static bool game_renders_to_framebuffer;
 static int game_framebuffer;
 static int game_framebuffer_msaa_resolved;
 
-struct VRSystem {
-    vr::IVRSystem* system;
-    vr::IVRCompositor* compositor;
-    vr::IVRRenderModels* render_models;
-    vr::TrackedDevicePose_t tracked_device_poses[vr::k_unMaxTrackedDeviceCount];
-    vr::HmdMatrix34_t eye_positions[2];
-    float eye_view_matrices[2][4][4];
-    float eye_projection_matrices_converted[2][4][4];
-    bool initialized;
-    int current_eye;
-};
-
 static VRSystem vr_system = {};
 
+VRSystem* GetVRSystem() {
+    return &vr_system;
+}
 
 uint32_t gfx_msaa_level = 1;
 
