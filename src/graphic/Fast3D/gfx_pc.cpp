@@ -1139,7 +1139,12 @@ static void gfx_matrix_mul(float res[4][4], const float a[4][4], const float b[4
 static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
-    if (auto it = current_mtx_replacements->find((Mtx*)addr); it != current_mtx_replacements->end()) {
+    // VR motion controls: if this matrix is a tagged hand limb, replace it with the LIVE controller
+    // pose (per eye) instead of the game-rate interpolated/decoded matrix, so the hands track at full
+    // headset rate (the same trick the camera uses). See vr_register_hand_matrix / vr_lookup_hand_matrix.
+    if (vr_is_initialized() && vr_lookup_hand_matrix((const void*)addr, matrix)) {
+        // matrix is now the live hand transform; skip the normal decode/replacement below.
+    } else if (auto it = current_mtx_replacements->find((Mtx*)addr); it != current_mtx_replacements->end()) {
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
                 float v = it->second.mf[i][j];

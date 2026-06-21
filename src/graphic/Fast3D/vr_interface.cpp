@@ -63,4 +63,48 @@ void VR_ClampRoomscaleLean(float max_units) {
     vr_clamp_roomscale_lean(max_units);
 }
 
+bool VR_GetHandPose(int hand, float pos[3], float quat[4]) {
+    return vr_get_hand_pose(hand, pos, quat);
+}
+
+bool VR_IsHandActive(int hand) {
+    return vr_is_hand_active(hand);
+}
+
+uint16_t VR_GetControllerButton(int hand) {
+    return vr_get_controller_buttons(hand);
+}
+
+void VR_GetThumbstick(int hand, float* x, float* y) {
+    vr_get_thumbstick(hand, x, y);
+}
+
+float VR_GetTrigger(int hand) {
+    return vr_get_trigger(hand);
+}
+
+float VR_GetGrip(int hand) {
+    return vr_get_grip(hand);
+}
+
+bool VR_GetHandMatrix(int hand, float out[4][4]) {
+    return vr_get_hand_matrix(hand, out);
+}
+
+void VR_SetHandScale(float s) {
+    vr_set_hand_scale(s);
+}
+
+void VR_SetHandMirror(bool mirror) {
+    vr_set_hand_mirror(mirror);
+}
+
+void VR_RegisterHandMatrix(const void* mtx, int hand) {
+    vr_register_hand_matrix(mtx, hand);
+}
+
+void VR_ClearHandMatrices(void) {
+    vr_clear_hand_matrices();
+}
+
 }

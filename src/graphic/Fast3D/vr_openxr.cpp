@@ -8,6 +8,7 @@
 #include <string>
 #include <cstring>
 #include <cmath>
+#include <unordered_map>
 
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -90,6 +91,31 @@ static struct {
     // body's collision-limited achieved move, and pushes anchor = bodyHead - roomscale_origin so the
     // eye stays continuous as the body slides under the head. See vr_roomscale_6dof plan.
     glm::vec2 roomscale_origin;
+
+    // Motion controls (OpenXR action sets). hand index: 0 = left, 1 = right.
+    XrActionSet action_set;
+    XrPath hand_path[2];               // /user/hand/left, /user/hand/right
+    XrAction grip_pose_action;         // POSE (per-hand subaction)
+    XrAction aim_pose_action;          // POSE (per-hand subaction)
+    XrAction trigger_action;           // FLOAT
+    XrAction squeeze_action;           // FLOAT (grip)
+    XrAction thumbstick_action;        // VECTOR2F
+    XrAction thumbstick_click_action;  // BOOL
+    XrAction primary_action;           // BOOL: A (right) / X (left)
+    XrAction secondary_action;         // BOOL: B (right) / Y (left)
+    XrAction menu_action;              // BOOL
+    XrSpace grip_space[2];
+    XrSpace aim_space[2];
+    bool input_initialized;
+    // Per-frame controller state (raw, in OpenXR local space)
+    bool hand_active[2];
+    XrPosef grip_pose[2];
+    XrPosef aim_pose[2];
+    float trigger_value[2];
+    float squeeze_value[2];
+    float thumbstick_x[2];
+    float thumbstick_y[2];
+    uint16_t buttons[2];               // VR_BTN_* bitmask per hand
 
     // HUD overlay
     XrSpace view_space;
@@ -218,6 +244,214 @@ static void poll_events() {
 }
 
 // --------------------------------------------------------------------------
+// Motion controls: OpenXR action-set setup + per-frame sync
+// --------------------------------------------------------------------------
+
+// Create the gameplay action set, controller pose + input actions, suggest bindings for the common
+// runtimes, attach to the session, and create per-hand pose spaces. Called once during vr_init after
+// the reference space exists. Optional: on failure motion controls are disabled but the HMD works.
+static bool setup_input() {
+    XrActionSetCreateInfo set_ci = { XR_TYPE_ACTION_SET_CREATE_INFO };
+    strcpy(set_ci.actionSetName, "gameplay");
+    strcpy(set_ci.localizedActionSetName, "Gameplay");
+    if (!xr_check(xrCreateActionSet(xr.instance, &set_ci, &xr.action_set), "xrCreateActionSet")) {
+        return false;
+    }
+
+    xrStringToPath(xr.instance, "/user/hand/left", &xr.hand_path[0]);
+    xrStringToPath(xr.instance, "/user/hand/right", &xr.hand_path[1]);
+
+    auto make_action = [&](const char* name, const char* localized, XrActionType type, XrAction* out) -> bool {
+        XrActionCreateInfo ci = { XR_TYPE_ACTION_CREATE_INFO };
+        strcpy(ci.actionName, name);
+        strcpy(ci.localizedActionName, localized);
+        ci.actionType = type;
+        ci.countSubactionPaths = 2;
+        ci.subactionPaths = xr.hand_path;
+        return xr_check(xrCreateAction(xr.action_set, &ci, out), "xrCreateAction");
+    };
+
+    bool ok = true;
+    ok &= make_action("grip_pose", "Grip Pose", XR_ACTION_TYPE_POSE_INPUT, &xr.grip_pose_action);
+    ok &= make_action("aim_pose", "Aim Pose", XR_ACTION_TYPE_POSE_INPUT, &xr.aim_pose_action);
+    ok &= make_action("trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT, &xr.trigger_action);
+    ok &= make_action("squeeze", "Squeeze", XR_ACTION_TYPE_FLOAT_INPUT, &xr.squeeze_action);
+    ok &= make_action("thumbstick", "Thumbstick", XR_ACTION_TYPE_VECTOR2F_INPUT, &xr.thumbstick_action);
+    ok &= make_action("thumbstick_click", "Thumbstick Click", XR_ACTION_TYPE_BOOLEAN_INPUT,
+                      &xr.thumbstick_click_action);
+    ok &= make_action("primary", "Primary Button", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.primary_action);
+    ok &= make_action("secondary", "Secondary Button", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.secondary_action);
+    ok &= make_action("menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.menu_action);
+    if (!ok) return false;
+
+    auto path = [&](const char* s) -> XrPath {
+        XrPath p = XR_NULL_PATH;
+        xrStringToPath(xr.instance, s, &p);
+        return p;
+    };
+    auto suggest = [&](const char* profile, std::vector<XrActionSuggestedBinding> binds) {
+        XrInteractionProfileSuggestedBinding sb = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+        sb.interactionProfile = path(profile);
+        sb.suggestedBindings = binds.data();
+        sb.countSuggestedBindings = static_cast<uint32_t>(binds.size());
+        xr_check(xrSuggestInteractionProfileBindings(xr.instance, &sb), "xrSuggestInteractionProfileBindings");
+    };
+
+    // Oculus Touch (Quest / Rift) — the most common.
+    suggest("/interaction_profiles/oculus/touch_controller",
+            { { xr.grip_pose_action, path("/user/hand/left/input/grip/pose") },
+              { xr.grip_pose_action, path("/user/hand/right/input/grip/pose") },
+              { xr.aim_pose_action, path("/user/hand/left/input/aim/pose") },
+              { xr.aim_pose_action, path("/user/hand/right/input/aim/pose") },
+              { xr.trigger_action, path("/user/hand/left/input/trigger/value") },
+              { xr.trigger_action, path("/user/hand/right/input/trigger/value") },
+              { xr.squeeze_action, path("/user/hand/left/input/squeeze/value") },
+              { xr.squeeze_action, path("/user/hand/right/input/squeeze/value") },
+              { xr.thumbstick_action, path("/user/hand/left/input/thumbstick") },
+              { xr.thumbstick_action, path("/user/hand/right/input/thumbstick") },
+              { xr.thumbstick_click_action, path("/user/hand/left/input/thumbstick/click") },
+              { xr.thumbstick_click_action, path("/user/hand/right/input/thumbstick/click") },
+              { xr.primary_action, path("/user/hand/left/input/x/click") },
+              { xr.primary_action, path("/user/hand/right/input/a/click") },
+              { xr.secondary_action, path("/user/hand/left/input/y/click") },
+              { xr.secondary_action, path("/user/hand/right/input/b/click") },
+              { xr.menu_action, path("/user/hand/left/input/menu/click") } });
+
+    // Valve Index.
+    suggest("/interaction_profiles/valve/index_controller",
+            { { xr.grip_pose_action, path("/user/hand/left/input/grip/pose") },
+              { xr.grip_pose_action, path("/user/hand/right/input/grip/pose") },
+              { xr.aim_pose_action, path("/user/hand/left/input/aim/pose") },
+              { xr.aim_pose_action, path("/user/hand/right/input/aim/pose") },
+              { xr.trigger_action, path("/user/hand/left/input/trigger/value") },
+              { xr.trigger_action, path("/user/hand/right/input/trigger/value") },
+              { xr.squeeze_action, path("/user/hand/left/input/squeeze/value") },
+              { xr.squeeze_action, path("/user/hand/right/input/squeeze/value") },
+              { xr.thumbstick_action, path("/user/hand/left/input/thumbstick") },
+              { xr.thumbstick_action, path("/user/hand/right/input/thumbstick") },
+              { xr.thumbstick_click_action, path("/user/hand/left/input/thumbstick/click") },
+              { xr.thumbstick_click_action, path("/user/hand/right/input/thumbstick/click") },
+              { xr.primary_action, path("/user/hand/left/input/a/click") },
+              { xr.primary_action, path("/user/hand/right/input/a/click") },
+              { xr.secondary_action, path("/user/hand/left/input/b/click") },
+              { xr.secondary_action, path("/user/hand/right/input/b/click") } });
+
+    // KHR simple controller — universal fallback (pose + select + menu only).
+    suggest("/interaction_profiles/khr/simple_controller",
+            { { xr.grip_pose_action, path("/user/hand/left/input/grip/pose") },
+              { xr.grip_pose_action, path("/user/hand/right/input/grip/pose") },
+              { xr.aim_pose_action, path("/user/hand/left/input/aim/pose") },
+              { xr.aim_pose_action, path("/user/hand/right/input/aim/pose") },
+              { xr.primary_action, path("/user/hand/left/input/select/click") },
+              { xr.primary_action, path("/user/hand/right/input/select/click") },
+              { xr.menu_action, path("/user/hand/left/input/menu/click") },
+              { xr.menu_action, path("/user/hand/right/input/menu/click") } });
+
+    XrSessionActionSetsAttachInfo attach = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
+    attach.countActionSets = 1;
+    attach.actionSets = &xr.action_set;
+    if (!xr_check(xrAttachSessionActionSets(xr.session, &attach), "xrAttachSessionActionSets")) {
+        return false;
+    }
+
+    for (int h = 0; h < 2; h++) {
+        XrActionSpaceCreateInfo as_ci = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
+        as_ci.poseInActionSpace = { { 0, 0, 0, 1 }, { 0, 0, 0 } };
+        as_ci.subactionPath = xr.hand_path[h];
+        as_ci.action = xr.grip_pose_action;
+        xr_check(xrCreateActionSpace(xr.session, &as_ci, &xr.grip_space[h]), "xrCreateActionSpace (grip)");
+        as_ci.action = xr.aim_pose_action;
+        xr_check(xrCreateActionSpace(xr.session, &as_ci, &xr.aim_space[h]), "xrCreateActionSpace (aim)");
+    }
+
+    xr.input_initialized = true;
+    spdlog::info("[VR] Motion-control input initialized");
+    return true;
+}
+
+// Sync controller actions and locate the hand poses each frame. Called from vr_begin_frame after the
+// views are located, with the same predicted display time. Safe to call before the session is focused
+// (everything reads inactive -> zeros).
+static void update_input() {
+    if (!xr.input_initialized) return;
+
+    XrActiveActionSet active = { xr.action_set, XR_NULL_PATH };
+    XrActionsSyncInfo sync = { XR_TYPE_ACTIONS_SYNC_INFO };
+    sync.countActiveActionSets = 1;
+    sync.activeActionSets = &active;
+    if (!XR_SUCCEEDED(xrSyncActions(xr.session, &sync))) {
+        return;
+    }
+
+    const XrTime t = xr.frame_state.predictedDisplayTime;
+
+    for (int h = 0; h < 2; h++) {
+        const XrPath hp = xr.hand_path[h];
+
+        XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
+        xrLocateSpace(xr.grip_space[h], xr.local_space, t, &loc);
+        const bool valid = (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+                           (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+        xr.hand_active[h] = valid;
+        if (valid) {
+            xr.grip_pose[h] = loc.pose;
+        }
+
+        XrSpaceLocation aloc = { XR_TYPE_SPACE_LOCATION };
+        xrLocateSpace(xr.aim_space[h], xr.local_space, t, &aloc);
+        if ((aloc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+            (aloc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+            xr.aim_pose[h] = aloc.pose;
+        }
+
+        auto get_float = [&](XrAction a) -> float {
+            XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
+            gi.action = a;
+            gi.subactionPath = hp;
+            XrActionStateFloat st = { XR_TYPE_ACTION_STATE_FLOAT };
+            if (XR_SUCCEEDED(xrGetActionStateFloat(xr.session, &gi, &st)) && st.isActive) {
+                return st.currentState;
+            }
+            return 0.0f;
+        };
+        auto get_bool = [&](XrAction a) -> bool {
+            XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
+            gi.action = a;
+            gi.subactionPath = hp;
+            XrActionStateBoolean st = { XR_TYPE_ACTION_STATE_BOOLEAN };
+            if (XR_SUCCEEDED(xrGetActionStateBoolean(xr.session, &gi, &st)) && st.isActive) {
+                return st.currentState == XR_TRUE;
+            }
+            return false;
+        };
+
+        xr.trigger_value[h] = get_float(xr.trigger_action);
+        xr.squeeze_value[h] = get_float(xr.squeeze_action);
+
+        XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
+        gi.action = xr.thumbstick_action;
+        gi.subactionPath = hp;
+        XrActionStateVector2f vst = { XR_TYPE_ACTION_STATE_VECTOR2F };
+        if (XR_SUCCEEDED(xrGetActionStateVector2f(xr.session, &gi, &vst)) && vst.isActive) {
+            xr.thumbstick_x[h] = vst.currentState.x;
+            xr.thumbstick_y[h] = vst.currentState.y;
+        } else {
+            xr.thumbstick_x[h] = xr.thumbstick_y[h] = 0.0f;
+        }
+
+        // Bitmask. Analog trigger/grip are thresholded so they also read as digital buttons.
+        uint16_t b = 0;
+        if (xr.trigger_value[h] > 0.6f) b |= (1 << 0);            // VR_BTN_TRIGGER
+        if (xr.squeeze_value[h] > 0.6f) b |= (1 << 1);            // VR_BTN_GRIP
+        if (get_bool(xr.primary_action)) b |= (1 << 2);          // VR_BTN_PRIMARY
+        if (get_bool(xr.secondary_action)) b |= (1 << 3);        // VR_BTN_SECONDARY
+        if (get_bool(xr.thumbstick_click_action)) b |= (1 << 4); // VR_BTN_THUMBCLICK
+        if (get_bool(xr.menu_action)) b |= (1 << 5);             // VR_BTN_MENU
+        xr.buttons[h] = b;
+    }
+}
+
+// --------------------------------------------------------------------------
 // Lifecycle
 // --------------------------------------------------------------------------
 
@@ -305,6 +539,10 @@ bool vr_init() {
         xrDestroyInstance(xr.instance);
         return false;
     }
+
+    // Motion-control input (controller poses + buttons). Optional — the HMD works without it, so a
+    // failure here just leaves input_initialized false and the VR_Get*Hand/Button APIs return empty.
+    setup_input();
 
     // --- Enumerate View Configuration ---
     uint32_t view_count = 0;
@@ -652,6 +890,9 @@ bool vr_begin_frame() {
         spdlog::warn("[VR] xrLocateViews failed");
         return false;
     }
+
+    // Sync controllers + locate hand poses for this frame (motion controls).
+    update_input();
 
     // Build matrices for each eye
     for (int eye = 0; eye < 2; eye++) {
@@ -1011,6 +1252,144 @@ void vr_set_interp_alpha(float alpha) {
     xr.interp_alpha = alpha;
 }
 
+// --------------------------------------------------------------------------
+// Motion controls: accessors (hand: 0 = left, 1 = right)
+// --------------------------------------------------------------------------
+
+// Controller grip pose in game-world coords, composed the SAME way as the camera eye: world pos =
+// anchor + grip_position * world_scale (interpolated anchor, so hands track the smoothly-rendered
+// body), orientation = the controller orientation in the game-world frame (the same basis the camera
+// uses). The game pushes the combined anchor (bodyHead - roomscale_origin) via vr_set_camera_anchor,
+// so hands are automatically consistent with the eye + roomscale. out_quat is x,y,z,w. Returns false
+// (and identity) if the hand isn't tracked.
+bool vr_get_hand_pose(int hand, float out_pos[3], float out_quat[4]) {
+    if (hand < 0 || hand > 1 || !xr.initialized || !xr.input_initialized || !xr.hand_active[hand]) {
+        out_pos[0] = out_pos[1] = out_pos[2] = 0.0f;
+        out_quat[0] = out_quat[1] = out_quat[2] = 0.0f;
+        out_quat[3] = 1.0f;
+        return false;
+    }
+    const XrPosef& p = xr.grip_pose[hand];
+    const glm::vec3 anchor = (xr.first_person && xr.anchor_initialized)
+                                 ? glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha)
+                                 : glm::vec3(0.0f);
+    out_pos[0] = anchor.x + p.position.x * xr.world_scale;
+    out_pos[1] = anchor.y + p.position.y * xr.world_scale;
+    out_pos[2] = anchor.z + p.position.z * xr.world_scale;
+    out_quat[0] = p.orientation.x;
+    out_quat[1] = p.orientation.y;
+    out_quat[2] = p.orientation.z;
+    out_quat[3] = p.orientation.w;
+    return true;
+}
+
+bool vr_is_hand_active(int hand) {
+    return (hand >= 0 && hand <= 1) && xr.input_initialized && xr.hand_active[hand];
+}
+
+uint16_t vr_get_controller_buttons(int hand) {
+    if (hand < 0 || hand > 1 || !xr.input_initialized) return 0;
+    return xr.buttons[hand];
+}
+
+void vr_get_thumbstick(int hand, float* x, float* y) {
+    if (hand < 0 || hand > 1 || !xr.input_initialized) {
+        *x = *y = 0.0f;
+        return;
+    }
+    *x = xr.thumbstick_x[hand];
+    *y = xr.thumbstick_y[hand];
+}
+
+float vr_get_trigger(int hand) {
+    if (hand < 0 || hand > 1 || !xr.input_initialized) return 0.0f;
+    return xr.trigger_value[hand];
+}
+
+float vr_get_grip(int hand) {
+    if (hand < 0 || hand > 1 || !xr.input_initialized) return 0.0f;
+    return xr.squeeze_value[hand];
+}
+
+// Live hand-matrix registry: maps each frame's hand limb Mtx* to its controller index so gfx_pc can
+// substitute a fresh controller pose per eye, bypassing the game-rate interpolation that makes the
+// hands judder (the camera is smooth for the same reason — it's replaced live per eye). g_hand_scale
+// is Link's model scale, folded into the hand matrix so the live-replaced hand renders at full size.
+static std::unordered_map<const void*, int> g_hand_mtx_registry;
+static float g_hand_scale = 1.0f;
+static bool g_hand_mirror = false; // reflect the hand geometry (flip handedness) when the controller
+                                   // drives Link's opposite-side hand model
+
+// Hand draw matrix (model-local -> game-world) in the engine's row-vector MtxF layout, for pinning
+// Link's hand limb to the controller. Same world position as vr_get_hand_pose (anchor + grip_pos *
+// world_scale, so hands stay consistent with the camera + roomscale), orientation = controller
+// orientation * a tunable calibration (gVrHandCal* CVars, degrees) so the held item lines up with the
+// real controller. Does NOT include Link's model scale — the game applies actor.scale afterward.
+// Layout matches pose_to_view_matrix (out[r][c] = glm column r, row c). false (+ identity) if untracked.
+bool vr_get_hand_matrix(int hand, float out[4][4]) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = (r == c) ? 1.0f : 0.0f;
+    if (hand < 0 || hand > 1 || !xr.initialized || !xr.input_initialized || !xr.hand_active[hand]) {
+        return false;
+    }
+    const XrPosef& p = xr.grip_pose[hand];
+    const glm::vec3 anchor = (xr.first_person && xr.anchor_initialized)
+                                 ? glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha)
+                                 : glm::vec3(0.0f);
+    const glm::vec3 world_pos(anchor.x + p.position.x * xr.world_scale,
+                              anchor.y + p.position.y * xr.world_scale,
+                              anchor.z + p.position.z * xr.world_scale);
+    glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+    const float kDeg = 3.14159265358979323846f / 180.0f;
+    glm::quat cal = glm::quat(glm::vec3(CVarGetFloat("gVrHandCalPitch", 0.0f) * kDeg,
+                                        CVarGetFloat("gVrHandCalYaw", 0.0f) * kDeg,
+                                        CVarGetFloat("gVrHandCalRoll", 0.0f) * kDeg));
+    // Mirror = reflect one model-local axis to flip the hand's handedness (the game also inverts the
+    // back-face culling for it). Which axis reads correctly depends on the hand bone's rest orientation,
+    // so it's tunable via gVrHandMirrorAxis (0=X, 1=Y, 2=Z).
+    glm::vec3 sc(g_hand_scale);
+    if (g_hand_mirror) {
+        int axis = CVarGetInteger("gVrHandMirrorAxis", 0);
+        if (axis < 0 || axis > 2) axis = 0;
+        sc[axis] = -sc[axis];
+    }
+    glm::mat4 m = glm::translate(glm::mat4(1.0f), world_pos) * glm::mat4_cast(q * cal) *
+                  glm::scale(glm::mat4(1.0f), sc);
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = m[r][c];
+    return true;
+}
+
+// Folds Link's model scale into the live hand matrix (the game sets this to actor.scale each frame).
+void vr_set_hand_scale(float s) {
+    g_hand_scale = s;
+}
+
+// Reflect the hand geometry to flip its apparent handedness (set when the controller drives Link's
+// opposite-side hand model). The game must also invert back-face culling for the mirrored hand.
+void vr_set_hand_mirror(bool mirror) {
+    g_hand_mirror = mirror;
+}
+
+// The game tags each hand limb's per-frame Mtx* (register) and clears the registry each game frame;
+// gfx_pc calls vr_lookup_hand_matrix per eye and, on a hit, uses the LIVE controller pose. addr is the
+// limb's Mtx pointer, matching gfx_sp_matrix's addr argument.
+void vr_register_hand_matrix(const void* mtx, int hand) {
+    if (mtx) g_hand_mtx_registry[mtx] = hand;
+}
+
+void vr_clear_hand_matrices() {
+    g_hand_mtx_registry.clear();
+}
+
+bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]) {
+    auto it = g_hand_mtx_registry.find(mtx);
+    if (it == g_hand_mtx_registry.end()) return false;
+    return vr_get_hand_matrix(it->second, out);
+}
+
 int16_t vr_get_head_yaw() {
     if (!xr.initialized) return 0;
     // Heading (yaw around the Y axis) of the headset, extracted from the HMD orientation.
@@ -1164,6 +1543,33 @@ void vr_add_roomscale_displacement(float, float) {}
 void vr_get_roomscale_origin(float out[2]) { out[0] = out[1] = 0.0f; }
 void vr_reset_roomscale() {}
 void vr_clamp_roomscale_lean(float) {}
+bool vr_get_hand_pose(int, float out_pos[3], float out_quat[4]) {
+    out_pos[0] = out_pos[1] = out_pos[2] = 0.0f;
+    out_quat[0] = out_quat[1] = out_quat[2] = 0.0f;
+    out_quat[3] = 1.0f;
+    return false;
+}
+bool vr_is_hand_active(int) { return false; }
+uint16_t vr_get_controller_buttons(int) { return 0; }
+void vr_get_thumbstick(int, float* x, float* y) { *x = *y = 0.0f; }
+float vr_get_trigger(int) { return 0.0f; }
+float vr_get_grip(int) { return 0.0f; }
+bool vr_get_hand_matrix(int, float out[4][4]) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = (r == c) ? 1.0f : 0.0f;
+    return false;
+}
+void vr_set_hand_scale(float) {}
+void vr_set_hand_mirror(bool) {}
+void vr_register_hand_matrix(const void*, int) {}
+void vr_clear_hand_matrices() {}
+bool vr_lookup_hand_matrix(const void*, float out[4][4]) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = (r == c) ? 1.0f : 0.0f;
+    return false;
+}
 int16_t vr_get_head_yaw() { return 0; }
 int16_t vr_get_heading_yaw() { return 0; }
 void vr_recenter_heading(int16_t) {}

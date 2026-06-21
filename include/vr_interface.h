@@ -47,6 +47,42 @@ void VR_ResetRoomscale(void);
 // stays within Link's collision; only physical 6DOF lean uses this slack). <= 0 disables.
 void VR_ClampRoomscaleLean(float max_units);
 
+// --- Motion controls ---
+// Hand index.
+#define VR_HAND_LEFT  0
+#define VR_HAND_RIGHT 1
+// Controller button bitmask (VR_GetControllerButton, per hand). Face buttons are per-hand:
+// PRIMARY = A (right) / X (left); SECONDARY = B (right) / Y (left). Analog trigger/grip are also
+// thresholded into the TRIGGER/GRIP bits so they read as digital buttons.
+#define VR_BTN_TRIGGER    (1 << 0)
+#define VR_BTN_GRIP       (1 << 1)
+#define VR_BTN_PRIMARY    (1 << 2)
+#define VR_BTN_SECONDARY  (1 << 3)
+#define VR_BTN_THUMBCLICK (1 << 4)
+#define VR_BTN_MENU       (1 << 5)
+
+// Controller grip pose in game-world coords (eye/anchor frame): pos in game units, quat is x,y,z,w.
+// Returns false (and identity) if that hand isn't tracked. Buttons/sticks/trigger/grip per hand.
+bool     VR_GetHandPose(int hand, float pos[3], float quat[4]);
+bool     VR_IsHandActive(int hand);
+uint16_t VR_GetControllerButton(int hand);
+void     VR_GetThumbstick(int hand, float* x, float* y);
+float    VR_GetTrigger(int hand);
+float    VR_GetGrip(int hand);
+// Hand draw matrix (model-local -> game-world, engine MtxF layout) for pinning Link's hand limb to the
+// controller. Includes Link's model scale (set via VR_SetHandScale). False if untracked.
+bool     VR_GetHandMatrix(int hand, float out[4][4]);
+
+// Live hand rendering. Set the model scale (Link's actor.scale) each frame; clear the hand-matrix
+// registry each frame, then tag each hand limb's Mtx* so gfx_pc replaces it with the live controller
+// pose per eye (full headset rate, no game-rate judder).
+void     VR_SetHandScale(float s);
+// Reflect the hand geometry to flip handedness (when a controller drives Link's opposite-side hand
+// model). The game must also invert back-face culling for the mirrored hand. Axis via gVrHandMirrorAxis.
+void     VR_SetHandMirror(bool mirror);
+void     VR_RegisterHandMatrix(const void* mtx, int hand);
+void     VR_ClearHandMatrices(void);
+
 #ifdef __cplusplus
 }
 #endif

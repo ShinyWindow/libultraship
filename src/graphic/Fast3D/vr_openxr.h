@@ -55,6 +55,29 @@ void vr_reset_roomscale();
 // driven camera within Link's collision; only physical lean uses this slack). <= 0 disables.
 void vr_clamp_roomscale_lean(float max_units);
 
+// Motion controls (OpenXR action sets). hand: 0 = left, 1 = right. Hand poses are in game-world
+// coords (same anchor + world_scale transform as the camera); out_quat is x,y,z,w. See the
+// vr_motion_controls plan.
+bool vr_get_hand_pose(int hand, float out_pos[3], float out_quat[4]);
+bool vr_is_hand_active(int hand);
+uint16_t vr_get_controller_buttons(int hand);
+void vr_get_thumbstick(int hand, float* x, float* y);
+float vr_get_trigger(int hand);
+float vr_get_grip(int hand);
+// Hand draw matrix (model-local -> game-world, engine row-vector MtxF layout) for pinning Link's hand
+// limb to the controller. Includes Link's model scale (set via vr_set_hand_scale). False if untracked.
+bool vr_get_hand_matrix(int hand, float out[4][4]);
+
+// Live hand rendering: the game tags each hand limb's per-frame Mtx* (register) + clears the registry
+// each frame; gfx_pc calls vr_lookup_hand_matrix per eye and substitutes the LIVE controller pose so
+// the hands track at headset rate instead of the interpolated game rate. vr_set_hand_scale folds in
+// Link's model scale so the live-replaced hand renders at the right size.
+void vr_set_hand_scale(float s);
+void vr_set_hand_mirror(bool mirror);
+void vr_register_hand_matrix(const void* mtx, int hand);
+void vr_clear_hand_matrices();
+bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]);
+
 // HMD-driven heading (Phase 2)
 int16_t vr_get_heading_yaw();
 void vr_recenter_heading(int16_t link_yaw);
