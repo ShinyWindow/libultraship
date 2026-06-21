@@ -77,6 +77,14 @@ static struct {
     float far_clip;          // In game units
     float resolution_scale;  // Multiplier on the runtime's recommended per-eye resolution
 
+    // First-person camera
+    bool first_person;        // When true, view is anchored to Link's head (game-driven)
+    glm::vec3 anchor;         // Link's head this game frame, in game/world units (set by the game)
+    glm::vec3 anchor_prev;    // Link's head the previous game frame (for sub-frame interpolation)
+    bool anchor_initialized;  // False until the first anchor is pushed
+    float interp_alpha;       // 0..1 blend between anchor_prev and anchor for the current render pass
+    int16_t heading_offset;   // binang offset mapping HMD yaw -> game-world yaw (set at recenter)
+
     // HUD overlay
     XrSpace view_space;
     struct EyeSwapchain hud_swapchain;
@@ -726,7 +734,28 @@ void vr_get_projection_matrix(int eye, float out[4][4]) {
 }
 
 void vr_get_view_matrix(int eye, float out[4][4]) {
-    memcpy(out, xr.view[eye], sizeof(float) * 16);
+    const float (*v)[4] = xr.view[eye];
+    if (!xr.first_person) {
+        memcpy(out, v, sizeof(float) * 16);
+        return;
+    }
+    // First-person: anchored_view = T(-anchor) * view  (row-vector convention).
+    // Pre-translating the world by -anchor places Link's head at the OpenXR local-space
+    // origin, so the HMD's positional offset reads relative to Link's head and orientation
+    // stays pure-HMD. Anchor is in game units, matching the world_scale-scaled HMD translation.
+    // Rows 0-2 are unchanged; only row 3 (the translation row) folds in the anchor.
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 4; c++) {
+            out[r][c] = v[r][c];
+        }
+    }
+    // The game pushes the anchor at 20 fps; interpolate it to this render sub-frame with the same
+    // alpha the engine uses for everything else, so the camera tracks the smoothly-rendered world.
+    const glm::vec3 a = glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha);
+    const float ax = a.x, ay = a.y, az = a.z;
+    for (int c = 0; c < 4; c++) {
+        out[3][c] = v[3][c] - ax * v[0][c] - ay * v[1][c] - az * v[2][c];
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -760,6 +789,78 @@ float vr_get_world_scale() {
 
 void vr_set_world_scale(float units_per_meter) {
     xr.world_scale = units_per_meter;
+}
+
+// --------------------------------------------------------------------------
+// First-person camera
+// --------------------------------------------------------------------------
+
+void vr_set_first_person(bool enabled) {
+    xr.first_person = enabled;
+}
+
+bool vr_is_first_person() {
+    return xr.first_person;
+}
+
+void vr_set_camera_anchor(float x, float y, float z) {
+    const glm::vec3 next(x, y, z);
+    if (!xr.anchor_initialized) {
+        xr.anchor = xr.anchor_prev = next;
+        xr.anchor_initialized = true;
+        return;
+    }
+    xr.anchor_prev = xr.anchor;
+    xr.anchor = next;
+    // Snap (skip interpolation) across large jumps like scene loads / warps, so the camera doesn't
+    // smear across the cut. Normal movement is only a few units per game frame.
+    const float kSnapDist = 200.0f;
+    const glm::vec3 delta = next - xr.anchor_prev;
+    if (glm::dot(delta, delta) > kSnapDist * kSnapDist) {
+        xr.anchor_prev = next;
+    }
+}
+
+void vr_set_interp_alpha(float alpha) {
+    xr.interp_alpha = alpha;
+}
+
+int16_t vr_get_head_yaw() {
+    if (!xr.initialized) return 0;
+    // Heading (yaw around the Y axis) of the headset, extracted from the HMD orientation.
+    const XrQuaternionf& q = xr.views[0].pose.orientation;
+    const float yaw = atan2f(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.y * q.y + q.z * q.z));
+    // Convert radians -> binary angle (binang): pi maps to 0x8000.
+    const float kPi = 3.14159265358979323846f;
+    return static_cast<int16_t>(yaw / kPi * 32768.0f);
+}
+
+// Raw HMD yaw with the sign convention applied (OpenXR's yaw axis may be inverted vs game binang).
+static int16_t vr_mapped_head_yaw() {
+    int16_t raw = vr_get_head_yaw();
+    if (CVarGetInteger("gVrHeadingInvert", 0)) {
+        raw = static_cast<int16_t>(-raw);
+    }
+    return raw;
+}
+
+int16_t vr_get_heading_yaw() {
+    // Game-world heading = recenter offset + mapped HMD yaw + manual tuning offset (all binang).
+    const int16_t manual = static_cast<int16_t>(CVarGetInteger("gVrHeadingManualOffset", 0));
+    // Calibration constants (binang, 0x10000 = 360 deg):
+    //  - kForwardCorrection: OpenXR's forward axis is 180 deg opposed to the game's, so without it
+    //    the whole movement frame is reversed (forward<->back, left<->right).
+    //  - kSkewCorrection: measured ~30 deg rightward skew; -30 deg rotates movement back to center.
+    // Residual error can still be trimmed live with gVrHeadingManualOffset.
+    const int kForwardCorrection = 0x8000;  // 180 deg
+    const int kSkewCorrection = 1820;        // +10 deg: compensates a measured ~10 deg rightward skew
+    return static_cast<int16_t>(xr.heading_offset + vr_mapped_head_yaw() + manual + kForwardCorrection +
+                                kSkewCorrection);
+}
+
+void vr_recenter_heading(int16_t link_yaw) {
+    // Capture the offset so the player's current physical facing maps to their in-game facing.
+    xr.heading_offset = static_cast<int16_t>(link_yaw - vr_mapped_head_yaw());
 }
 
 void vr_rebind_current_eye_target() {
@@ -840,6 +941,13 @@ void vr_get_recommended_resolution(uint32_t* w, uint32_t* h) { *w = 0; *h = 0; }
 uint32_t vr_get_refresh_rate() { return 90; }
 float vr_get_world_scale() { return 1.0f; }
 void vr_set_world_scale(float) {}
+void vr_set_first_person(bool) {}
+bool vr_is_first_person() { return false; }
+void vr_set_camera_anchor(float, float, float) {}
+int16_t vr_get_head_yaw() { return 0; }
+int16_t vr_get_heading_yaw() { return 0; }
+void vr_recenter_heading(int16_t) {}
+void vr_set_interp_alpha(float) {}
 void vr_rebind_current_eye_target() {}
 void vr_set_hud_commands(void*) {}
 void* vr_get_hud_commands() { return nullptr; }

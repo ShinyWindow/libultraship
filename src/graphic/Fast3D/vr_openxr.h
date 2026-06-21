@@ -29,6 +29,20 @@ uint32_t vr_get_refresh_rate();
 float vr_get_world_scale();
 void vr_set_world_scale(float units_per_meter);
 
+// First-person camera
+void vr_set_first_person(bool enabled);
+bool vr_is_first_person();
+void vr_set_camera_anchor(float x, float y, float z);
+int16_t vr_get_head_yaw();
+
+// HMD-driven heading (Phase 2)
+int16_t vr_get_heading_yaw();
+void vr_recenter_heading(int16_t link_yaw);
+
+// Sub-frame interpolation factor (0..1) for the current render pass, so the camera anchor can be
+// interpolated between game frames in lockstep with the rest of the interpolated world.
+void vr_set_interp_alpha(float alpha);
+
 // Render target rebind (called when sub-framebuffer operations restore the main target)
 void vr_rebind_current_eye_target();
 

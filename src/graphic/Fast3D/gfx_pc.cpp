@@ -1185,8 +1185,13 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
                 // Option B: Follow game camera position ONLY, rotation from VR headset only.
                 //           To switch to Option B, comment out Option A and uncomment Option B.
 
-                // --- Option A: Full lookAt (position + rotation from game) ---
-                gfx_matrix_mul(g_rsp.P_matrix, matrix, g_rsp.P_matrix);
+                // First-person VR: the anchored VR view (pre-translated to Link's head) already
+                // positions the eye and takes orientation from the HMD, so the game's third-person
+                // lookAt must NOT be applied. Skip it; otherwise fall through to Option A below.
+                if (!vr_is_first_person()) {
+                    // --- Option A: Full lookAt (position + rotation from game) ---
+                    gfx_matrix_mul(g_rsp.P_matrix, matrix, g_rsp.P_matrix);
+                }
 
                 // --- Option B: Position only (rotation from VR headset only) ---
                 // Extract camera world position, discard its rotation.
