@@ -35,6 +35,15 @@ bool vr_is_first_person();
 void vr_set_camera_anchor(float x, float y, float z);
 int16_t vr_get_head_yaw();
 
+// Camera unification (Phase 3): report the rendered HMD pose to the game so its CPU-side camera
+// systems (frustum culling, audio panning, projected-position/LOD) agree with what the player sees.
+// vr_get_camera_pose returns the center-eye pose in game-world coords (eye position + forward/up
+// unit direction vectors). vr_get_culling_fovy returns a vertical FOV (degrees) wide enough to cover
+// the whole binocular VR view, so peripheral geometry isn't culled. Only meaningful while
+// first-person is active.
+void vr_get_camera_pose(float eye[3], float fwd[3], float up[3]);
+float vr_get_culling_fovy();
+
 // HMD-driven heading (Phase 2)
 int16_t vr_get_heading_yaw();
 void vr_recenter_heading(int16_t link_yaw);

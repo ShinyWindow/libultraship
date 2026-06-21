@@ -27,6 +27,14 @@ int16_t VR_GetHeadYaw(void);
 int16_t VR_GetHeadingYaw(void);
 void    VR_RecenterHeading(int16_t linkYaw);
 
+// Camera unification (Phase 3). VR_GetCameraPose returns the rendered HMD pose in game-world coords
+// (eye position + forward/up unit vectors); VR_GetCullingFovy returns a vertical FOV (degrees) wide
+// enough to cover the binocular VR view. The game feeds these into its View so CPU-side systems
+// (frustum culling, audio panning, projected-position/LOD) match what the player sees. Rendering is
+// unaffected. Only meaningful while first-person is active.
+void  VR_GetCameraPose(float eye[3], float fwd[3], float up[3]);
+float VR_GetCullingFovy(void);
+
 #ifdef __cplusplus
 }
 #endif

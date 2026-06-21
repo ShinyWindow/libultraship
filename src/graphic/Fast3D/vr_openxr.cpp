@@ -758,6 +758,79 @@ void vr_get_view_matrix(int eye, float out[4][4]) {
     }
 }
 
+// Camera pose in game-world coords, matching the rendered (anchored) HMD view. The game feeds this
+// into its own View (eye/lookAt/up) so frustum culling, audio panning and projected-position math
+// align with what the player sees. Rendering is untouched (gfx_pc builds clip from the per-eye VR
+// matrices and skips the game's lookAt in first-person).
+//
+// Derivation, no matrix inversion required: the rendered view maps a world point p to view space as
+// R^-1 * (p - pos - anchor) (see vr_get_view_matrix), so the camera-to-world transform is
+// translate(anchor + pos) * R. Hence eye = anchor + pos and the world forward/up are the HMD
+// orientation's basis vectors (view space looks down -Z). Because the returned (eye, fwd, up) triple
+// is self-consistent, feeding it back through the game's guLookAt reproduces the rendered view
+// matrix exactly, sidestepping the OpenXR<->game axis-sign pitfalls that bit heading. Uses the
+// center eye (average of the two eye poses). pos is scaled by world_scale to game units.
+void vr_get_camera_pose(float eye[3], float fwd[3], float up[3]) {
+    // Sensible identity defaults if a frame hasn't been located yet.
+    eye[0] = eye[1] = eye[2] = 0.0f;
+    fwd[0] = 0.0f; fwd[1] = 0.0f; fwd[2] = -1.0f;
+    up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f;
+    if (!xr.initialized) return;
+
+    // Center-eye position (midpoint of the two eyes), scaled to game units.
+    glm::vec3 pos = 0.5f *
+        (glm::vec3(xr.views[0].pose.position.x, xr.views[0].pose.position.y, xr.views[0].pose.position.z) +
+         glm::vec3(xr.views[1].pose.position.x, xr.views[1].pose.position.y, xr.views[1].pose.position.z));
+    pos *= xr.world_scale;
+
+    // Center orientation: hemisphere-aligned, normalized average of the two eye quaternions (they're
+    // near-identical, so an nlerp at 0.5 is plenty for culling). Bail to defaults if unset.
+    const XrQuaternionf& q0r = xr.views[0].pose.orientation;
+    const XrQuaternionf& q1r = xr.views[1].pose.orientation;
+    glm::quat q0(q0r.w, q0r.x, q0r.y, q0r.z);
+    glm::quat q1(q1r.w, q1r.x, q1r.y, q1r.z);
+    if (glm::dot(q0, q1) < 0.0f) q1 = -q1;
+    glm::quat q = q0 + q1;
+    float qlen = glm::length(q);
+    if (qlen < 1e-6f) return;
+    q *= (1.0f / qlen);
+    glm::mat3 R = glm::mat3_cast(q);
+
+    // eye = Link's head anchor + the HMD's positional offset (the world point the render maps to the
+    // view origin). Use the latest pushed anchor; for a per-game-frame culling query, sub-frame
+    // interpolation isn't needed.
+    glm::vec3 anchor = (xr.first_person && xr.anchor_initialized) ? xr.anchor : glm::vec3(0.0f);
+    glm::vec3 e = anchor + pos;
+    glm::vec3 f = R * glm::vec3(0.0f, 0.0f, -1.0f);
+    glm::vec3 u = R * glm::vec3(0.0f, 1.0f, 0.0f);
+
+    eye[0] = e.x; eye[1] = e.y; eye[2] = e.z;
+    fwd[0] = f.x; fwd[1] = f.y; fwd[2] = f.z;
+    up[0] = u.x; up[1] = u.y; up[2] = u.z;
+}
+
+// Vertical FOV (degrees) for the game's culling frustum, sized to cover the whole VR view. The
+// game's native ~60-degree fovy is far narrower than the binocular VR field, so reusing it would
+// cull geometry that's actually visible at the periphery (the very pop-in this fixes). Take the
+// wider eye's vertical FOV and pad it generously; the culling projection derives its horizontal
+// extent from the game's aspect ratio, so a wide fovy widens horizontal coverage too. Over-wide
+// just draws slightly more geometry; too-narrow re-introduces edge pop-in, so we err wide.
+float vr_get_culling_fovy() {
+    const float kDefault = 100.0f;
+    if (!xr.initialized) return kDefault;
+    float vfov = 0.0f; // radians
+    for (int eye = 0; eye < 2; eye++) {
+        float v = xr.views[eye].fov.angleUp - xr.views[eye].fov.angleDown;
+        if (v > vfov) vfov = v;
+    }
+    if (vfov <= 0.0f) return kDefault;
+    const float kPad = 1.3f; // +30% headroom so nothing visible is culled
+    float deg = glm::degrees(vfov) * kPad;
+    if (deg < 90.0f) deg = 90.0f;
+    if (deg > 160.0f) deg = 160.0f;
+    return deg;
+}
+
 // --------------------------------------------------------------------------
 // State queries
 // --------------------------------------------------------------------------
@@ -944,6 +1017,12 @@ void vr_set_world_scale(float) {}
 void vr_set_first_person(bool) {}
 bool vr_is_first_person() { return false; }
 void vr_set_camera_anchor(float, float, float) {}
+void vr_get_camera_pose(float eye[3], float fwd[3], float up[3]) {
+    eye[0] = eye[1] = eye[2] = 0.0f;
+    fwd[0] = 0.0f; fwd[1] = 0.0f; fwd[2] = -1.0f;
+    up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f;
+}
+float vr_get_culling_fovy() { return 100.0f; }
 int16_t vr_get_head_yaw() { return 0; }
 int16_t vr_get_heading_yaw() { return 0; }
 void vr_recenter_heading(int16_t) {}

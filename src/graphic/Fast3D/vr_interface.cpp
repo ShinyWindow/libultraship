@@ -35,4 +35,12 @@ void VR_RecenterHeading(int16_t linkYaw) {
     vr_recenter_heading(linkYaw);
 }
 
+void VR_GetCameraPose(float eye[3], float fwd[3], float up[3]) {
+    vr_get_camera_pose(eye, fwd, up);
+}
+
+float VR_GetCullingFovy(void) {
+    return vr_get_culling_fovy();
+}
+
 }
