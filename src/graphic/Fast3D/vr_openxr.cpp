@@ -19,6 +19,8 @@ using Microsoft::WRL::ComPtr;
 
 #include <spdlog/spdlog.h>
 
+#include "public/bridge/consolevariablebridge.h"
+
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -62,6 +64,7 @@ static struct {
     XrFrameState frame_state;
     bool frame_began;
     int current_eye;
+    uint32_t refresh_rate;  // Cached headset refresh in Hz, derived from predictedDisplayPeriod
     uint32_t current_image_index[2]; // Acquired swapchain image index per eye
 
     // Cached per-frame matrices (row-major, row-vector convention)
@@ -69,9 +72,10 @@ static struct {
     float view[2][4][4];
 
     // Configuration
-    float world_scale;  // N64 units per meter
-    float near_clip;    // In game units
-    float far_clip;     // In game units
+    float world_scale;       // N64 units per meter
+    float near_clip;         // In game units
+    float far_clip;          // In game units
+    float resolution_scale;  // Multiplier on the runtime's recommended per-eye resolution
 
     // HUD overlay
     XrSpace view_space;
@@ -211,6 +215,17 @@ bool vr_init() {
     xr.near_clip = 10.0f;
     xr.far_clip = 30000.0f;
 
+    // Per-eye resolution multiplier. Runtimes (esp. SteamVR) often bake a supersampling
+    // factor into the "recommended" size, so each eye can be 1.4-2x the panel resolution.
+    // This is the main GPU-cost lever in VR; drop below 1.0 to trade sharpness for framerate.
+    // Tunable via the gVrResolutionScale CVar (takes effect on next vr_init).
+    xr.resolution_scale = CVarGetFloat("gVrResolutionScale", 1.0f);
+    if (xr.resolution_scale < 0.1f) xr.resolution_scale = 0.1f;
+    if (xr.resolution_scale > 2.0f) xr.resolution_scale = 2.0f;
+
+    // Sane default until the first frame is located and we can read the true display period.
+    xr.refresh_rate = 90;
+
     // --- Create Instance ---
     const char* extensions[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
 
@@ -321,9 +336,22 @@ bool vr_init() {
     // --- Create Swapchains (one per eye) ---
     for (uint32_t eye = 0; eye < 2; eye++) {
         auto& sc = xr.eye_swapchains[eye];
-        sc.width = xr.config_views[eye].recommendedImageRectWidth;
-        sc.height = xr.config_views[eye].recommendedImageRectHeight;
+
+        // Apply the resolution multiplier, then clamp to what the runtime allows.
+        uint32_t scaled_w = (uint32_t)lroundf(xr.config_views[eye].recommendedImageRectWidth * xr.resolution_scale);
+        uint32_t scaled_h = (uint32_t)lroundf(xr.config_views[eye].recommendedImageRectHeight * xr.resolution_scale);
+        if (scaled_w < 1) scaled_w = 1;
+        if (scaled_h < 1) scaled_h = 1;
+        if (scaled_w > xr.config_views[eye].maxImageRectWidth) scaled_w = xr.config_views[eye].maxImageRectWidth;
+        if (scaled_h > xr.config_views[eye].maxImageRectHeight) scaled_h = xr.config_views[eye].maxImageRectHeight;
+
+        sc.width = scaled_w;
+        sc.height = scaled_h;
         sc.format = chosen_format;
+
+        spdlog::info("[VR] Eye {} render resolution: {}x{} (recommended {}x{}, scale {:.2f})", eye, sc.width, sc.height,
+                     xr.config_views[eye].recommendedImageRectWidth, xr.config_views[eye].recommendedImageRectHeight,
+                     xr.resolution_scale);
 
         XrSwapchainCreateInfo swapchain_ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
         swapchain_ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
@@ -536,6 +564,15 @@ bool vr_begin_frame() {
         return false;
     }
 
+    // Derive the headset refresh rate from the nominal display period (nanoseconds). This paces
+    // the game's fixed-timestep logic via the interpolation system (see GetInterpolationFPS).
+    if (xr.frame_state.predictedDisplayPeriod > 0) {
+        uint32_t hz = (uint32_t)(1.0e9 / (double)xr.frame_state.predictedDisplayPeriod + 0.5);
+        if (hz >= 30 && hz <= 1000) {
+            xr.refresh_rate = hz;
+        }
+    }
+
     XrFrameBeginInfo begin_info = { XR_TYPE_FRAME_BEGIN_INFO };
     if (!xr_check(xrBeginFrame(xr.session, &begin_info), "xrBeginFrame")) {
         return false;
@@ -706,9 +743,15 @@ int vr_get_current_eye() {
 
 void vr_get_recommended_resolution(uint32_t* width, uint32_t* height) {
     if (xr.initialized) {
-        *width = xr.config_views[0].recommendedImageRectWidth;
-        *height = xr.config_views[0].recommendedImageRectHeight;
+        // Return the actual (scaled) swapchain size, not the raw recommendation, so the
+        // engine's render dimensions match the viewport bound in vr_begin_eye().
+        *width = xr.eye_swapchains[0].width;
+        *height = xr.eye_swapchains[0].height;
     }
+}
+
+uint32_t vr_get_refresh_rate() {
+    return xr.refresh_rate ? xr.refresh_rate : 90;
 }
 
 float vr_get_world_scale() {
@@ -794,6 +837,7 @@ void vr_get_view_matrix(int, float out[4][4]) { memset(out, 0, sizeof(float) * 1
 bool vr_is_initialized() { return false; }
 int vr_get_current_eye() { return 0; }
 void vr_get_recommended_resolution(uint32_t* w, uint32_t* h) { *w = 0; *h = 0; }
+uint32_t vr_get_refresh_rate() { return 90; }
 float vr_get_world_scale() { return 1.0f; }
 void vr_set_world_scale(float) {}
 void vr_rebind_current_eye_target() {}

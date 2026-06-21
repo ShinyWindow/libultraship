@@ -31,6 +31,7 @@
 #include "gfx_direct3d_common.h"
 #include "gfx_screen_config.h"
 #include "gfx_pc.h"
+#include "vr_openxr.h"
 
 #define DECLARE_GFX_DXGI_FUNCTIONS
 #include "gfx_dxgi.h"
@@ -937,6 +938,27 @@ static bool gfx_dxgi_is_frame_ready() {
 
 static void gfx_dxgi_swap_buffers_begin() {
     LARGE_INTEGER t;
+
+    // In VR, the OpenXR compositor (xrWaitFrame/xrEndFrame) is the sole frame-pacing
+    // authority. Running the desktop frame-limiter and vsync present here double-paces the
+    // loop against the headset cadence, which caps and stutters the framerate. Present the
+    // mirror window immediately and unsynced; let OpenXR own the timing.
+    bool vr_active = vr_is_initialized();
+    if (vr_active) {
+        QueryPerformanceCounter(&t);
+        dxgi.previous_present_time = t;
+        // SyncInterval 0 = no vsync. Allow tearing on the mirror if the swapchain supports it.
+        UINT present_flags = dxgi.tearing_support ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        ThrowIfFailed(dxgi.swap_chain->Present(0, present_flags));
+
+        UINT vr_present_id;
+        if (dxgi.swap_chain->GetLastPresentCount(&vr_present_id) == S_OK) {
+            dxgi.pending_frame_stats.insert(std::make_pair(vr_present_id, (UINT)0));
+        }
+        dxgi.dropped_frame = false;
+        return;
+    }
+
     dxgi.use_timer = true;
     if (dxgi.use_timer || (dxgi.tearing_support && !dxgi.is_vsync_enabled)) {
         ComPtr<ID3D11Device> device;
@@ -991,6 +1013,13 @@ static void gfx_dxgi_swap_buffers_end() {
     LARGE_INTEGER t0, t1, t2;
     QueryPerformanceCounter(&t0);
     QueryPerformanceCounter(&t1);
+
+    // VR: OpenXR paces the loop, so don't block on the mirror swapchain's frame-latency
+    // object — that would add a second, conflicting wait on top of xrWaitFrame.
+    if (vr_is_initialized()) {
+        dxgi.dropped_frame = false;
+        return;
+    }
 
     if (dxgi.applied_maximum_frame_latency > dxgi.maximum_frame_latency) {
         // If latency is decreased, you have to wait the same amout of times as the old latency was set to

@@ -23,6 +23,9 @@ void vr_get_view_matrix(int eye, float out[4][4]);
 bool vr_is_initialized();
 int vr_get_current_eye();
 void vr_get_recommended_resolution(uint32_t* width, uint32_t* height);
+// Headset display refresh rate in Hz (e.g. 72/90/120). Used to pace the game's fixed-timestep
+// logic via the interpolation system. Returns a sane default before the first frame is located.
+uint32_t vr_get_refresh_rate();
 float vr_get_world_scale();
 void vr_set_world_scale(float units_per_meter);
 
