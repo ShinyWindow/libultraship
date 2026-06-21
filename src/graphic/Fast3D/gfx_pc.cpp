@@ -4434,6 +4434,35 @@ void gfx_run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacemen
     // VR: swapchain image released by vr_end_eye() in the caller
 }
 
+void gfx_run_vr_mirror() {
+    // In VR the game renders only to the OpenXR eye swapchains, so the companion window's backbuffer
+    // (framebuffer 0) is never bound and stays blank. Bind it here and point the "Main Game" ImGui
+    // image at the captured left eye, so the subsequent gui->EndDraw() composites the headset view
+    // into the window with the menu (F1) drawn on top.
+    if (!vr_is_initialized()) {
+        return;
+    }
+
+    // gfx_start_frame() clobbered gfx_current_window_dimensions with the per-eye render size, so query
+    // the real window size directly for the backbuffer.
+    uint32_t win_w = 0, win_h = 0;
+    int32_t pos_x = 0, pos_y = 0;
+    gfx_wapi->get_dimensions(&win_w, &win_h, &pos_x, &pos_y);
+    if (win_w == 0) {
+        win_w = 1;
+    }
+    if (win_h == 0) {
+        win_h = 1;
+    }
+
+    gfx_rapi->update_framebuffer_parameters(0, win_w, win_h, 1, false, true, true, false);
+    gfx_rapi->start_draw_to_framebuffer(0, 1);
+    gfx_rapi->clear_framebuffer(true, true);
+
+    // DrawGame() renders this texture as the full-window background; ImGui handles the scaling.
+    gfxFramebuffer = (uintptr_t)vr_get_mirror_texture_id();
+}
+
 void gfx_end_frame() {
     gfx_rapi->end_frame();
     gfx_wapi->swap_buffers_begin();

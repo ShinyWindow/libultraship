@@ -44,6 +44,17 @@ int16_t vr_get_head_yaw();
 void vr_get_camera_pose(float eye[3], float fwd[3], float up[3]);
 float vr_get_culling_fovy();
 
+// Roomscale 6DOF (physical translation moves Link's body, collision-swept). roomscale_origin is the
+// horizontal physical-walk displacement (game units) baked into the body; the game advances it only
+// by the body's collision-limited achieved move. See vr_roomscale_6dof plan.
+void vr_get_roomscale_desired(float out[2]);
+void vr_add_roomscale_displacement(float dx, float dz);
+void vr_get_roomscale_origin(float out[2]);
+void vr_reset_roomscale();
+// Bound how far the camera may sit from Link's body horizontally (comfort + keeps the controller-
+// driven camera within Link's collision; only physical lean uses this slack). <= 0 disables.
+void vr_clamp_roomscale_lean(float max_units);
+
 // HMD-driven heading (Phase 2)
 int16_t vr_get_heading_yaw();
 void vr_recenter_heading(int16_t link_yaw);
@@ -61,3 +72,11 @@ void* vr_get_hud_commands();
 void vr_begin_hud();
 void vr_end_hud();
 bool vr_is_rendering_hud();
+
+// Desktop mirror: copy the rendered left eye into a sampleable texture so the companion window can
+// display what the headset sees (and ImGui can composite the menu on top of it). vr_capture_mirror
+// must run while the left-eye swapchain image is still acquired (i.e. before vr_end_eye(0) releases
+// it). vr_get_mirror_texture_id returns the SRV as an ImTextureID-compatible pointer, or null if the
+// mirror isn't available.
+void vr_capture_mirror();
+void* vr_get_mirror_texture_id();

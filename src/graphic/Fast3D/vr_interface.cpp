@@ -43,4 +43,24 @@ float VR_GetCullingFovy(void) {
     return vr_get_culling_fovy();
 }
 
+void VR_GetRoomscaleDesired(float out[2]) {
+    vr_get_roomscale_desired(out);
+}
+
+void VR_AddRoomscaleDisplacement(float dx, float dz) {
+    vr_add_roomscale_displacement(dx, dz);
+}
+
+void VR_GetRoomscaleOrigin(float out[2]) {
+    vr_get_roomscale_origin(out);
+}
+
+void VR_ResetRoomscale(void) {
+    vr_reset_roomscale();
+}
+
+void VR_ClampRoomscaleLean(float max_units) {
+    vr_clamp_roomscale_lean(max_units);
+}
+
 }

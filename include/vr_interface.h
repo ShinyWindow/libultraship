@@ -35,6 +35,18 @@ void    VR_RecenterHeading(int16_t linkYaw);
 void  VR_GetCameraPose(float eye[3], float fwd[3], float up[3]);
 float VR_GetCullingFovy(void);
 
+// Roomscale 6DOF (physical walking moves Link's body, collision-swept). The game reads the desired
+// per-frame body move (VR_GetRoomscaleDesired), collision-sweeps it, reports the achieved amount
+// (VR_AddRoomscaleDisplacement), and pushes anchor = bodyHead - VR_GetRoomscaleOrigin. VR_ResetRoomscale
+// re-zeros so the current physical position maps to Link's current body (recenter / scene / enable).
+void VR_GetRoomscaleDesired(float out[2]);
+void VR_AddRoomscaleDisplacement(float dx, float dz);
+void VR_GetRoomscaleOrigin(float out[2]);
+void VR_ResetRoomscale(void);
+// Bound how far the camera may sit from Link's body horizontally (so the controller-driven camera
+// stays within Link's collision; only physical 6DOF lean uses this slack). <= 0 disables.
+void VR_ClampRoomscaleLean(float max_units);
+
 #ifdef __cplusplus
 }
 #endif

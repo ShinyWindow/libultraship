@@ -85,12 +85,24 @@ static struct {
     float interp_alpha;       // 0..1 blend between anchor_prev and anchor for the current render pass
     int16_t heading_offset;   // binang offset mapping HMD yaw -> game-world yaw (set at recenter)
 
+    // Roomscale 6DOF: accumulated horizontal physical-walk displacement (game units, .x = world x,
+    // .y = world z) that has been baked into Link's body position. The game advances it ONLY by the
+    // body's collision-limited achieved move, and pushes anchor = bodyHead - roomscale_origin so the
+    // eye stays continuous as the body slides under the head. See vr_roomscale_6dof plan.
+    glm::vec2 roomscale_origin;
+
     // HUD overlay
     XrSpace view_space;
     struct EyeSwapchain hud_swapchain;
     uint32_t hud_image_index;
     void* hud_commands;
     bool rendering_hud;
+
+    // Desktop mirror: a copy of the left eye for display in the companion window. We can't sample the
+    // swapchain image directly at present time (the runtime owns it once released), so the left eye is
+    // copied here each frame while still acquired.
+    ComPtr<ID3D11Texture2D> mirror_texture;
+    ComPtr<ID3D11ShaderResourceView> mirror_srv;
 
     // D3D11 cached pointers
     ID3D11Device* d3d_device;
@@ -222,6 +234,7 @@ bool vr_init() {
     xr.world_scale = 35.0f;
     xr.near_clip = 10.0f;
     xr.far_clip = 30000.0f;
+    xr.roomscale_origin = glm::vec2(0.0f);
 
     // Per-eye resolution multiplier. Runtimes (esp. SteamVR) often bake a supersampling
     // factor into the "recommended" size, so each eye can be 1.4-2x the panel resolution.
@@ -438,6 +451,38 @@ bool vr_init() {
         spdlog::info("[VR] Eye {} swapchain: {}x{}, {} images", eye, sc.width, sc.height, image_count);
     }
 
+    // --- Create desktop mirror texture (a copy of the left eye, shown in the companion window) ---
+    {
+        const auto& eye0 = xr.eye_swapchains[0];
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = eye0.width;
+        desc.Height = eye0.height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = static_cast<DXGI_FORMAT>(eye0.format);
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        HRESULT hr = xr.d3d_device->CreateTexture2D(&desc, nullptr, xr.mirror_texture.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hr)) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+            srv_desc.Format = static_cast<DXGI_FORMAT>(eye0.format);
+            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srv_desc.Texture2D.MipLevels = 1;
+            hr = xr.d3d_device->CreateShaderResourceView(xr.mirror_texture.Get(), &srv_desc,
+                                                         xr.mirror_srv.ReleaseAndGetAddressOf());
+        }
+        if (FAILED(hr)) {
+            // Non-fatal: the headset still renders, the companion window just won't show the mirror.
+            spdlog::warn("[VR] Failed to create desktop mirror texture; companion window will be blank");
+            xr.mirror_texture.Reset();
+            xr.mirror_srv.Reset();
+        } else {
+            spdlog::info("[VR] Desktop mirror texture: {}x{}", eye0.width, eye0.height);
+        }
+    }
+
     // --- Create VIEW reference space (head-locked, for HUD overlay) ---
     XrReferenceSpaceCreateInfo view_space_ci = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
     view_space_ci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
@@ -534,6 +579,9 @@ void vr_shutdown() {
         sc.rtvs.clear(); sc.dsvs.clear(); sc.depth_textures.clear(); sc.images.clear();
         if (sc.handle != XR_NULL_HANDLE) { xrDestroySwapchain(sc.handle); sc.handle = XR_NULL_HANDLE; }
     }
+
+    xr.mirror_srv.Reset();
+    xr.mirror_texture.Reset();
     if (xr.view_space != XR_NULL_HANDLE) {
         xrDestroySpace(xr.view_space);
         xr.view_space = XR_NULL_HANDLE;
@@ -720,6 +768,12 @@ void vr_begin_eye(int eye) {
 void vr_end_eye(int eye) {
     if (!xr.initialized) return;
 
+    // Grab the left eye for the desktop mirror while its swapchain image is still acquired — once
+    // released below, the runtime owns the texture again and it's no longer safe to read.
+    if (eye == 0) {
+        vr_capture_mirror();
+    }
+
     auto& sc = xr.eye_swapchains[eye];
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(sc.handle, &release_info), "xrReleaseSwapchainImage");
@@ -829,6 +883,65 @@ float vr_get_culling_fovy() {
     if (deg < 90.0f) deg = 90.0f;
     if (deg > 160.0f) deg = 160.0f;
     return deg;
+}
+
+// --------------------------------------------------------------------------
+// Roomscale 6DOF (physical walking moves Link's body, collision-swept)
+// --------------------------------------------------------------------------
+
+// Center-eye position (midpoint of the two eyes), scaled to game units. Zero if not located yet.
+static glm::vec3 center_eye_pos_scaled() {
+    if (!xr.initialized) return glm::vec3(0.0f);
+    glm::vec3 pos = 0.5f *
+        (glm::vec3(xr.views[0].pose.position.x, xr.views[0].pose.position.y, xr.views[0].pose.position.z) +
+         glm::vec3(xr.views[1].pose.position.x, xr.views[1].pose.position.y, xr.views[1].pose.position.z));
+    return pos * xr.world_scale;
+}
+
+// How far Link's body should try to move this frame to sit back under the head: the current head
+// horizontal offset (game units) minus the displacement already baked into the body. The game
+// rate-limits this, collision-sweeps it, and reports the achieved amount via the call below.
+void vr_get_roomscale_desired(float out[2]) {
+    glm::vec3 head = center_eye_pos_scaled();
+    out[0] = head.x - xr.roomscale_origin.x;
+    out[1] = head.z - xr.roomscale_origin.y;
+}
+
+// Advance the baked-in origin by the body's ACHIEVED horizontal move (collision-limited). Advancing
+// by the achieved amount (not the desired amount) is what leaves blocked motion as a head-lean.
+void vr_add_roomscale_displacement(float dx, float dz) {
+    xr.roomscale_origin.x += dx;
+    xr.roomscale_origin.y += dz;
+}
+
+// The baked-in origin (.x = world x, .y = world z), so the game can push anchor = bodyHead - origin.
+void vr_get_roomscale_origin(float out[2]) {
+    out[0] = xr.roomscale_origin.x;
+    out[1] = xr.roomscale_origin.y;
+}
+
+// Re-zero roomscale so the player's current physical position maps to Link's current body position
+// (desired -> 0, no body jerk). Called on recenter / first-person enable / scene change.
+void vr_reset_roomscale() {
+    glm::vec3 head = center_eye_pos_scaled();
+    xr.roomscale_origin.x = head.x;
+    xr.roomscale_origin.y = head.z;
+}
+
+// Clamp the head-lean — how far the camera sits horizontally from Link's body — to max_units, by
+// advancing the baked-in origin toward the current head offset. The controller only ever moves the
+// (collision-bounded) body, so this is what stops a large physical head offset (or wall-blocked
+// motion) from floating the camera far past Link / out of bounds. max_units <= 0 disables it.
+void vr_clamp_roomscale_lean(float max_units) {
+    if (max_units <= 0.0f || !xr.initialized) return;
+    glm::vec3 head = center_eye_pos_scaled();
+    glm::vec2 residual(head.x - xr.roomscale_origin.x, head.z - xr.roomscale_origin.y);
+    float len = glm::length(residual);
+    if (len > max_units && len > 1e-4f) {
+        glm::vec2 clamped = residual * (max_units / len);
+        xr.roomscale_origin.x = head.x - clamped.x;
+        xr.roomscale_origin.y = head.z - clamped.y;
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -997,6 +1110,29 @@ void vr_end_hud() {
 
 bool vr_is_rendering_hud() { return xr.rendering_hud; }
 
+// --------------------------------------------------------------------------
+// Desktop mirror
+// --------------------------------------------------------------------------
+
+void vr_capture_mirror() {
+    if (!xr.initialized || !xr.mirror_texture) return;
+
+    auto& sc = xr.eye_swapchains[0];
+    uint32_t idx = xr.current_image_index[0];
+    if (idx >= sc.images.size()) return;
+
+    ID3D11Texture2D* src = sc.images[idx].texture;
+    if (src) {
+        // Mirror texture was created with the same format/size as the eye swapchain image, so a
+        // straight resource copy is valid (no shader blit needed).
+        xr.d3d_context->CopyResource(xr.mirror_texture.Get(), src);
+    }
+}
+
+void* vr_get_mirror_texture_id() {
+    return xr.mirror_srv.Get();
+}
+
 #else // !ENABLE_DX11
 
 // Stubs for non-D3D11 builds
@@ -1023,6 +1159,11 @@ void vr_get_camera_pose(float eye[3], float fwd[3], float up[3]) {
     up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f;
 }
 float vr_get_culling_fovy() { return 100.0f; }
+void vr_get_roomscale_desired(float out[2]) { out[0] = out[1] = 0.0f; }
+void vr_add_roomscale_displacement(float, float) {}
+void vr_get_roomscale_origin(float out[2]) { out[0] = out[1] = 0.0f; }
+void vr_reset_roomscale() {}
+void vr_clamp_roomscale_lean(float) {}
 int16_t vr_get_head_yaw() { return 0; }
 int16_t vr_get_heading_yaw() { return 0; }
 void vr_recenter_heading(int16_t) {}
@@ -1033,5 +1174,7 @@ void* vr_get_hud_commands() { return nullptr; }
 void vr_begin_hud() {}
 void vr_end_hud() {}
 bool vr_is_rendering_hud() { return false; }
+void vr_capture_mirror() {}
+void* vr_get_mirror_texture_id() { return nullptr; }
 
 #endif

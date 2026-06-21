@@ -200,6 +200,10 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
         }
 
         vr_end_frame();
+
+        // Mirror the left eye into the companion window's backbuffer so the desktop shows what the
+        // headset sees. gui->EndDraw() (below) then composites this plus the ImGui menu (F1) on top.
+        gfx_run_vr_mirror();
     } else {
         // Non-VR path
         gfx_start_frame();

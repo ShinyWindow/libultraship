@@ -247,6 +247,9 @@ void gfx_start_frame();
 void gfx_run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
 void gfx_handle_window_events();
 bool gfx_is_frame_ready();
+// VR only: bind the companion-window backbuffer and stage the captured left eye for compositing.
+// Call after vr_end_frame() and before the GUI's EndDraw() so the headset view + menu reach the window.
+void gfx_run_vr_mirror();
 void gfx_end_frame();
 void gfx_set_target_ucode(UcodeHandlers ucode);
 void gfx_set_target_fps(int);
