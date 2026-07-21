@@ -3,6 +3,14 @@
 
 extern "C" {
 
+void VR_SetFlatScreen(bool enabled) {
+    vr_set_flat_screen(enabled);
+}
+
+bool VR_IsFlatScreen(void) {
+    return vr_get_flat_screen();
+}
+
 bool VR_IsInitialized() {
     return vr_is_initialized();
 }
@@ -95,8 +103,8 @@ void VR_SetHandScale(float s) {
     vr_set_hand_scale(s);
 }
 
-void VR_SetHandMirror(bool mirror) {
-    vr_set_hand_mirror(mirror);
+void VR_SetHandMirror(int hand, bool mirror) {
+    vr_set_hand_mirror(hand, mirror);
 }
 
 void VR_RegisterHandMatrix(const void* mtx, int hand) {

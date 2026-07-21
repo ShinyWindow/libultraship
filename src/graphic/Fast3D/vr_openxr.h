@@ -73,7 +73,7 @@ bool vr_get_hand_matrix(int hand, float out[4][4]);
 // the hands track at headset rate instead of the interpolated game rate. vr_set_hand_scale folds in
 // Link's model scale so the live-replaced hand renders at the right size.
 void vr_set_hand_scale(float s);
-void vr_set_hand_mirror(bool mirror);
+void vr_set_hand_mirror(int hand, bool mirror);
 void vr_register_hand_matrix(const void* mtx, int hand);
 void vr_clear_hand_matrices();
 bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]);
@@ -95,6 +95,14 @@ void* vr_get_hud_commands();
 void vr_begin_hud();
 void vr_end_hud();
 bool vr_is_rendering_hud();
+
+// Flat-screen mode: 2D contexts (file select, pause) render the whole frame to a world-locked
+// floating panel instead of the stereo eyes; the frozen world stays behind it, still head-tracked.
+void vr_set_flat_screen(bool enabled);
+bool vr_get_flat_screen();
+void vr_begin_screen();
+void vr_end_screen();
+void vr_get_2d_target_size(uint32_t* w, uint32_t* h);
 
 // Desktop mirror: copy the rendered left eye into a sampleable texture so the companion window can
 // display what the headset sees (and ImGui can composite the menu on top of it). vr_capture_mirror

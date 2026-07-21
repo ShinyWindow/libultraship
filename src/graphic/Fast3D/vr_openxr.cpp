@@ -107,6 +107,10 @@ static struct {
     XrSpace grip_space[2];
     XrSpace aim_space[2];
     bool input_initialized;
+    // Raw located view poses, preserved for compositor submission. The game-facing poses in `views`
+    // get the artificial snap-turn applied; the compositor must instead see the physical head pose
+    // the rendered image corresponds to (the turn is a world-space change, not a head-pose change).
+    XrPosef submit_pose[2];
     // Per-frame controller state (raw, in OpenXR local space)
     bool hand_active[2];
     XrPosef grip_pose[2];
@@ -123,6 +127,17 @@ static struct {
     uint32_t hud_image_index;
     void* hud_commands;
     bool rendering_hud;
+
+    // Flat-screen mode: 2D contexts (file select, pause menu) render the whole frame onto a
+    // world-locked floating panel instead of the stereo eyes. The last-rendered world frame keeps
+    // being submitted behind it with its original pose, so it stays frozen-but-head-tracked.
+    bool flat_screen;
+    bool flat_screen_prev;
+    XrPosef flat_pose; // panel pose in local_space (RAW tracking coords — quads bypass the snap-turn)
+    struct EyeSwapchain screen_swapchain;
+    uint32_t screen_image_index;
+    bool rendering_screen;   // currently rendering into the screen swapchain (vs the HUD's)
+    bool eyes_ever_rendered; // don't submit the projection layer before its swapchains have content
 
     // Desktop mirror: a copy of the left eye for display in the companion window. We can't sample the
     // swapchain image directly at present time (the runtime owns it once released), so the left eye is
@@ -452,6 +467,40 @@ static void update_input() {
 }
 
 // --------------------------------------------------------------------------
+// Artificial snap-turn: an accumulated world-space yaw (rotation + the translation that keeps the
+// pivot fixed) applied to every game-facing pose. Never applied to compositor-submitted poses.
+// --------------------------------------------------------------------------
+
+static glm::quat g_turn_rot(1.0f, 0.0f, 0.0f, 0.0f);
+static glm::vec3 g_turn_off(0.0f);
+
+static XrPosef apply_turn(const XrPosef& p) {
+    const glm::vec3 pos = g_turn_rot * glm::vec3(p.position.x, p.position.y, p.position.z) + g_turn_off;
+    const glm::quat q =
+        g_turn_rot * glm::quat(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+    XrPosef out;
+    out.position = { pos.x, pos.y, pos.z };
+    out.orientation = { q.x, q.y, q.z, q.w };
+    return out;
+}
+
+// Rotate the world by `degrees_right` (positive = player turns right) about the vertical axis
+// through the player's current head position. Pivoting on the head keeps the player in place —
+// any other pivot would translate them sideways as they turn. Called with this frame's raw views
+// located but not yet turn-adjusted.
+static void vr_apply_snap_turn(float degrees_right) {
+    const float rad = degrees_right * (3.14159265358979323846f / 180.0f);
+    // Right-handed yaw about +Y turns left, so turning right is the negative angle.
+    const glm::quat r = glm::angleAxis(-rad, glm::vec3(0.0f, 1.0f, 0.0f));
+    const glm::vec3 raw_center =
+        0.5f * (glm::vec3(xr.views[0].pose.position.x, xr.views[0].pose.position.y, xr.views[0].pose.position.z) +
+                glm::vec3(xr.views[1].pose.position.x, xr.views[1].pose.position.y, xr.views[1].pose.position.z));
+    const glm::vec3 pivot = g_turn_rot * raw_center + g_turn_off; // where the head currently appears
+    g_turn_rot = glm::normalize(r * g_turn_rot);
+    g_turn_off = r * (g_turn_off - pivot) + pivot;
+}
+
+// --------------------------------------------------------------------------
 // Lifecycle
 // --------------------------------------------------------------------------
 
@@ -570,27 +619,35 @@ bool vr_init() {
     std::vector<int64_t> formats(format_count);
     xrEnumerateSwapchainFormats(xr.session, format_count, &format_count, formats.data());
 
-    // Prefer UNORM to match the game's rendering pipeline (which outputs gamma-space colors).
-    // SRGB would double-encode gamma, causing a washed-out/hazy appearance.
-    // Fall back to SRGB if UNORM is not supported by the runtime.
+    // The game outputs gamma-encoded (sRGB) colors. The swapchain must be created with an
+    // SRGB format so the compositor decodes them correctly; a UNORM swapchain makes the
+    // compositor treat gamma values as linear and re-encode them, washing the image out.
+    // Writes still go through a UNORM view (below) so the bits land in the texture verbatim.
     int64_t chosen_format = formats[0]; // fallback to first supported
     for (int64_t fmt : formats) {
-        if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
+        if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
             chosen_format = fmt;
             break;
         }
     }
-    if (chosen_format != DXGI_FORMAT_R8G8B8A8_UNORM) {
-        // UNORM not available — pick SRGB as next best, accept the gamma mismatch for now
+    if (chosen_format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+        // SRGB not available — pick UNORM as next best, accept the gamma mismatch for now
         for (int64_t fmt : formats) {
-            if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+            if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
                 chosen_format = fmt;
                 break;
             }
         }
     }
-    spdlog::info("[VR] Swapchain format: {} (UNORM={}, SRGB={})",
-                 chosen_format, (int)DXGI_FORMAT_R8G8B8A8_UNORM, (int)DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    // OpenXR D3D11 swapchain textures are allocated typeless, so views may use either
+    // variant of the format family. Using the UNORM variant for RTVs/SRVs stores and
+    // reads the game's already-gamma-encoded output without any extra conversion.
+    DXGI_FORMAT view_format = (chosen_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+                                  ? DXGI_FORMAT_R8G8B8A8_UNORM
+                                  : static_cast<DXGI_FORMAT>(chosen_format);
+    spdlog::info("[VR] Swapchain format: {} (UNORM={}, SRGB={}), view format: {}",
+                 chosen_format, (int)DXGI_FORMAT_R8G8B8A8_UNORM, (int)DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                 (int)view_format);
 
     // --- Create Swapchains (one per eye) ---
     for (uint32_t eye = 0; eye < 2; eye++) {
@@ -642,7 +699,7 @@ bool vr_init() {
         for (uint32_t i = 0; i < image_count; i++) {
             // RTV
             D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-            rtv_desc.Format = static_cast<DXGI_FORMAT>(chosen_format);
+            rtv_desc.Format = view_format;
             rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
             rtv_desc.Texture2D.MipSlice = 0;
             HRESULT hr = xr.d3d_device->CreateRenderTargetView(
@@ -697,7 +754,7 @@ bool vr_init() {
         desc.Height = eye0.height;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
-        desc.Format = static_cast<DXGI_FORMAT>(eye0.format);
+        desc.Format = view_format;
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -705,7 +762,7 @@ bool vr_init() {
         HRESULT hr = xr.d3d_device->CreateTexture2D(&desc, nullptr, xr.mirror_texture.ReleaseAndGetAddressOf());
         if (SUCCEEDED(hr)) {
             D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-            srv_desc.Format = static_cast<DXGI_FORMAT>(eye0.format);
+            srv_desc.Format = view_format;
             srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             srv_desc.Texture2D.MipLevels = 1;
             hr = xr.d3d_device->CreateShaderResourceView(xr.mirror_texture.Get(), &srv_desc,
@@ -764,7 +821,7 @@ bool vr_init() {
 
         for (uint32_t i = 0; i < image_count; i++) {
             D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-            rtv_desc.Format = static_cast<DXGI_FORMAT>(chosen_format);
+            rtv_desc.Format = view_format;
             rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
             xr.d3d_device->CreateRenderTargetView(sc.images[i].texture, &rtv_desc, sc.rtvs[i].GetAddressOf());
 
@@ -785,6 +842,63 @@ bool vr_init() {
             xr.d3d_device->CreateDepthStencilView(sc.depth_textures[i].Get(), &dsv_desc, sc.dsvs[i].GetAddressOf());
         }
         spdlog::info("[VR] HUD swapchain: {}x{}, {} images", sc.width, sc.height, image_count);
+    }
+
+    // --- Create flat-screen swapchain (whole-frame panel for 2D contexts: file select, pause) ---
+    {
+        auto& sc = xr.screen_swapchain;
+        sc.width = 1280;
+        sc.height = 960;
+        sc.format = chosen_format;
+
+        XrSwapchainCreateInfo swapchain_ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+        swapchain_ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+        swapchain_ci.format = chosen_format;
+        swapchain_ci.sampleCount = 1;
+        swapchain_ci.width = sc.width;
+        swapchain_ci.height = sc.height;
+        swapchain_ci.faceCount = 1;
+        swapchain_ci.arraySize = 1;
+        swapchain_ci.mipCount = 1;
+
+        if (!xr_check(xrCreateSwapchain(xr.session, &swapchain_ci, &sc.handle), "xrCreateSwapchain (screen)")) {
+            vr_shutdown();
+            return false;
+        }
+
+        uint32_t image_count = 0;
+        xrEnumerateSwapchainImages(sc.handle, 0, &image_count, nullptr);
+        sc.images.resize(image_count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
+        xrEnumerateSwapchainImages(sc.handle, image_count, &image_count,
+                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(sc.images.data()));
+
+        sc.rtvs.resize(image_count);
+        sc.dsvs.resize(image_count);
+        sc.depth_textures.resize(image_count);
+
+        for (uint32_t i = 0; i < image_count; i++) {
+            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+            rtv_desc.Format = view_format;
+            rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            xr.d3d_device->CreateRenderTargetView(sc.images[i].texture, &rtv_desc, sc.rtvs[i].GetAddressOf());
+
+            D3D11_TEXTURE2D_DESC depth_desc = {};
+            depth_desc.Width = sc.width;
+            depth_desc.Height = sc.height;
+            depth_desc.MipLevels = 1;
+            depth_desc.ArraySize = 1;
+            depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+            depth_desc.SampleDesc.Count = 1;
+            depth_desc.Usage = D3D11_USAGE_DEFAULT;
+            depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+            xr.d3d_device->CreateTexture2D(&depth_desc, nullptr, sc.depth_textures[i].GetAddressOf());
+
+            D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
+            dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
+            dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+            xr.d3d_device->CreateDepthStencilView(sc.depth_textures[i].Get(), &dsv_desc, sc.dsvs[i].GetAddressOf());
+        }
+        spdlog::info("[VR] Screen swapchain: {}x{}, {} images", sc.width, sc.height, image_count);
     }
 
     // Initialize views
@@ -817,6 +931,15 @@ void vr_shutdown() {
         sc.rtvs.clear(); sc.dsvs.clear(); sc.depth_textures.clear(); sc.images.clear();
         if (sc.handle != XR_NULL_HANDLE) { xrDestroySwapchain(sc.handle); sc.handle = XR_NULL_HANDLE; }
     }
+
+    {
+        auto& sc = xr.screen_swapchain;
+        sc.rtvs.clear(); sc.dsvs.clear(); sc.depth_textures.clear(); sc.images.clear();
+        if (sc.handle != XR_NULL_HANDLE) { xrDestroySwapchain(sc.handle); sc.handle = XR_NULL_HANDLE; }
+    }
+    xr.eyes_ever_rendered = false;
+    xr.flat_screen = false;
+    xr.flat_screen_prev = false;
 
     xr.mirror_srv.Reset();
     xr.mirror_texture.Reset();
@@ -877,6 +1000,15 @@ bool vr_begin_frame() {
         return false;
     }
 
+    // Live-tunable world scale (game units per real-world meter). Higher = the world feels smaller;
+    // together with the game-unit head offsets this fully controls perceived height above the ground.
+    {
+        float ws = CVarGetFloat("gVrWorldScale", 35.0f);
+        if (ws < 5.0f) ws = 5.0f;
+        if (ws > 200.0f) ws = 200.0f;
+        xr.world_scale = ws;
+    }
+
     // Locate views (get per-eye pose and FOV)
     XrViewState view_state = { XR_TYPE_VIEW_STATE };
     XrViewLocateInfo view_locate_info = { XR_TYPE_VIEW_LOCATE_INFO };
@@ -894,6 +1026,62 @@ bool vr_begin_frame() {
     // Sync controllers + locate hand poses for this frame (motion controls).
     update_input();
 
+    // Flat-screen panel placement: on entering a 2D context, drop the panel in front of the
+    // player's current gaze. Uses the RAW located pose — quad layers are submitted in local_space
+    // and never include the artificial snap-turn.
+    if (xr.flat_screen && !xr.flat_screen_prev) {
+        const XrPosef& vp = xr.views[0].pose;
+        const glm::vec3 head(0.5f * (xr.views[0].pose.position.x + xr.views[1].pose.position.x),
+                             0.5f * (xr.views[0].pose.position.y + xr.views[1].pose.position.y),
+                             0.5f * (xr.views[0].pose.position.z + xr.views[1].pose.position.z));
+        const glm::quat ho(vp.orientation.w, vp.orientation.x, vp.orientation.y, vp.orientation.z);
+        glm::vec3 fwd = ho * glm::vec3(0.0f, 0.0f, -1.0f);
+        fwd.y = 0.0f;
+        const float len = glm::length(fwd);
+        fwd = (len > 1e-4f) ? fwd / len : glm::vec3(0.0f, 0.0f, -1.0f);
+        float dist = CVarGetFloat("gVrScreenDistance", 2.2f);
+        if (dist < 0.5f) dist = 0.5f;
+        const glm::vec3 pos = head + fwd * dist;
+        // Yaw-only orientation, the quad's front (+Z) facing back at the player.
+        const float qyaw = atan2f(-fwd.x, -fwd.z);
+        const glm::quat q = glm::angleAxis(qyaw, glm::vec3(0.0f, 1.0f, 0.0f));
+        xr.flat_pose.position = { pos.x, pos.y, pos.z };
+        xr.flat_pose.orientation = { q.x, q.y, q.z, q.w };
+    }
+    xr.flat_screen_prev = xr.flat_screen;
+
+    // Snap turn (right stick X): latch a discrete turn on a threshold crossing; the stick must
+    // return to center before the next snap fires. Suspended in flat-screen mode, where the right
+    // stick navigates menus (C-buttons) instead.
+    if (xr.input_initialized && !xr.flat_screen && CVarGetInteger("gVrSnapTurnOn", 1)) {
+        static int snap_latch = 0;
+        const float sx = xr.thumbstick_x[1];
+        if (snap_latch == 0 && fabsf(sx) > 0.6f) {
+            snap_latch = (sx > 0.0f) ? 1 : -1;
+            vr_apply_snap_turn(snap_latch * CVarGetFloat("gVrSnapTurnDegrees", 45.0f));
+        } else if (snap_latch != 0 && fabsf(sx) < 0.3f) {
+            snap_latch = 0;
+        }
+    }
+
+    // Apply the accumulated snap-turn to every game-facing pose, preserving the raw view poses for
+    // layer submission in vr_end_frame. Hand poses are only adjusted when freshly located this frame
+    // (a stale pose already carries the previous turn and would be double-rotated). In flat-screen
+    // mode the submit poses are NOT refreshed: the projection layer keeps re-submitting the last
+    // world frame with the pose it was rendered from, so the frozen world stays world-locked.
+    for (int eye = 0; eye < 2; eye++) {
+        if (!xr.flat_screen) {
+            xr.submit_pose[eye] = xr.views[eye].pose;
+        }
+        xr.views[eye].pose = apply_turn(xr.views[eye].pose);
+    }
+    for (int h = 0; h < 2; h++) {
+        if (xr.hand_active[h]) {
+            xr.grip_pose[h] = apply_turn(xr.grip_pose[h]);
+            xr.aim_pose[h] = apply_turn(xr.aim_pose[h]);
+        }
+    }
+
     // Build matrices for each eye
     for (int eye = 0; eye < 2; eye++) {
         build_projection_matrix(xr.views[eye].fov, xr.near_clip, xr.far_clip, xr.projection[eye]);
@@ -910,7 +1098,9 @@ void vr_end_frame() {
     XrCompositionLayerProjectionView projection_views[2] = {};
     for (int eye = 0; eye < 2; eye++) {
         projection_views[eye] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
-        projection_views[eye].pose = xr.views[eye].pose;
+        // Submit the RAW physical pose, not the turn-adjusted one — reprojection must compare
+        // against where the player's head actually is, or the compositor would fight the snap turn.
+        projection_views[eye].pose = xr.submit_pose[eye];
         projection_views[eye].fov = xr.views[eye].fov;
         projection_views[eye].subImage.swapchain = xr.eye_swapchains[eye].handle;
         projection_views[eye].subImage.imageRect.offset = { 0, 0 };
@@ -941,17 +1131,42 @@ void vr_end_frame() {
     hud_layer.pose = { { 0, 0, 0, 1 }, { 0, 0, -2.0f } };
     hud_layer.size = { 1.5f, 1.125f };
 
-    const XrCompositionLayerBaseHeader* layers[] = {
-        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection_layer),
-        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud_layer)
+    // Flat-screen quad (world-locked panel with the whole 2D frame: file select, pause menu)
+    XrCompositionLayerQuad screen_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+    screen_layer.space = xr.local_space;
+    screen_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    screen_layer.subImage.swapchain = xr.screen_swapchain.handle;
+    screen_layer.subImage.imageRect.offset = { 0, 0 };
+    screen_layer.subImage.imageRect.extent = {
+        static_cast<int32_t>(xr.screen_swapchain.width),
+        static_cast<int32_t>(xr.screen_swapchain.height)
     };
+    screen_layer.subImage.imageArrayIndex = 0;
+    screen_layer.pose = xr.flat_pose;
+    {
+        float sw = CVarGetFloat("gVrScreenSize", 2.4f);
+        if (sw < 0.5f) sw = 0.5f;
+        screen_layer.size = { sw, sw * 0.75f }; // 4:3, matching the swapchain
+    }
+
+    // Assemble layers back-to-front. The projection (world) layer is only submitted once its
+    // swapchains have ever been rendered (at boot we go straight into flat-screen file select).
+    const XrCompositionLayerBaseHeader* layers[3];
+    uint32_t layer_count = 0;
+    if (xr.eyes_ever_rendered) {
+        layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection_layer);
+    }
+    if (xr.flat_screen) {
+        layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&screen_layer);
+    }
+    layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud_layer);
 
     XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
     end_info.displayTime = xr.frame_state.predictedDisplayTime;
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 
     if (xr.frame_state.shouldRender) {
-        end_info.layerCount = 2;
+        end_info.layerCount = layer_count;
         end_info.layers = layers;
     } else {
         end_info.layerCount = 0;
@@ -968,6 +1183,7 @@ void vr_end_frame() {
 void vr_begin_eye(int eye) {
     if (!xr.initialized) return;
     xr.current_eye = eye;
+    xr.eyes_ever_rendered = true;
 
     auto& sc = xr.eye_swapchains[eye];
 
@@ -1317,8 +1533,9 @@ float vr_get_grip(int hand) {
 // is Link's model scale, folded into the hand matrix so the live-replaced hand renders at full size.
 static std::unordered_map<const void*, int> g_hand_mtx_registry;
 static float g_hand_scale = 1.0f;
-static bool g_hand_mirror = false; // reflect the hand geometry (flip handedness) when the controller
-                                   // drives Link's opposite-side hand model
+static bool g_hand_mirror[2] = { false, false }; // per controller hand: reflect the hand geometry
+                                                 // (flip handedness) when it drives Link's
+                                                 // opposite-side hand model
 
 // Hand draw matrix (model-local -> game-world) in the engine's row-vector MtxF layout, for pinning
 // Link's hand limb to the controller. Same world position as vr_get_hand_pose (anchor + grip_pos *
@@ -1342,19 +1559,45 @@ bool vr_get_hand_matrix(int hand, float out[4][4]) {
                               anchor.z + p.position.z * xr.world_scale);
     glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
     const float kDeg = 3.14159265358979323846f / 180.0f;
-    glm::quat cal = glm::quat(glm::vec3(CVarGetFloat("gVrHandCalPitch", 0.0f) * kDeg,
-                                        CVarGetFloat("gVrHandCalYaw", 0.0f) * kDeg,
-                                        CVarGetFloat("gVrHandCalRoll", 0.0f) * kDeg));
-    // Mirror = reflect one model-local axis to flip the hand's handedness (the game also inverts the
-    // back-face culling for it). Which axis reads correctly depends on the hand bone's rest orientation,
-    // so it's tunable via gVrHandMirrorAxis (0=X, 1=Y, 2=Z).
+    // Mirror axis: which model-local axis the reflection negates. The hand meshes' fingers/grip run
+    // along model +X (the sword blade extends along hand-space +X, see the melee weapon tip/base in
+    // z_player_lib.c), so the left<->right symmetry plane must KEEP X and flip the thumb axis —
+    // default Z. Reflecting X itself (old default) turns the mesh inside-out instead of opposite-handed.
+    int axis = CVarGetInteger("gVrHandMirrorAxis", 2);
+    if (axis < 0 || axis > 2) axis = 2;
+    const bool mirrored = g_hand_mirror[hand];
+    // Calibration (model rest pose -> controller grip frame). Defaults were hand-tuned in-headset
+    // against the MIRRORED sword hand on the right controller, which uses the mirror-conjugate of
+    // these values (F * cal * F: the Euler component about the mirror axis is preserved, the other
+    // two are negated). An UNMIRRORED hand also uses the conjugate regardless of controller: OpenXR
+    // grip frames are defined per-hand (palm-relative), so mirror-symmetric physical poses report
+    // the same orientation — an unreflected mesh attaches with the same rotation on either side.
+    glm::vec3 calDeg(CVarGetFloat("gVrHandCalPitch", 88.0f), CVarGetFloat("gVrHandCalYaw", -100.0f),
+                     CVarGetFloat("gVrHandCalRoll", 80.0f));
+    // Positional offset (game units) in the controller grip frame, so the hand mesh can be nudged
+    // to sit naturally on the controller; the conjugate reflects it (negate the mirror-axis component).
+    glm::vec3 off(CVarGetFloat("gVrHandOffX", 0.0f), CVarGetFloat("gVrHandOffY", 0.0f),
+                  CVarGetFloat("gVrHandOffZ", 0.0f));
+    if (hand == 0 && CVarGetInteger("gVrHandLOverride", 1)) {
+        // Fully independent left-controller tuning (values used literally, no conjugation).
+        calDeg = glm::vec3(CVarGetFloat("gVrHandLCalPitch", -149.0f), CVarGetFloat("gVrHandLCalYaw", 76.0f),
+                           CVarGetFloat("gVrHandLCalRoll", 30.0f));
+        off = glm::vec3(CVarGetFloat("gVrHandLOffX", 0.0f), CVarGetFloat("gVrHandLOffY", 0.0f),
+                        CVarGetFloat("gVrHandLOffZ", 0.0f));
+    } else if (hand == 1 || !mirrored) {
+        for (int k = 0; k < 3; k++) {
+            if (k != axis) calDeg[k] = -calDeg[k];
+        }
+        off[axis] = -off[axis];
+    }
+    glm::quat cal = glm::quat(calDeg * kDeg);
+    // Mirror = reflect the chosen model-local axis to flip the hand's handedness (the game also
+    // inverts back-face culling for it).
     glm::vec3 sc(g_hand_scale);
-    if (g_hand_mirror) {
-        int axis = CVarGetInteger("gVrHandMirrorAxis", 0);
-        if (axis < 0 || axis > 2) axis = 0;
+    if (mirrored) {
         sc[axis] = -sc[axis];
     }
-    glm::mat4 m = glm::translate(glm::mat4(1.0f), world_pos) * glm::mat4_cast(q * cal) *
+    glm::mat4 m = glm::translate(glm::mat4(1.0f), world_pos + q * off) * glm::mat4_cast(q * cal) *
                   glm::scale(glm::mat4(1.0f), sc);
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++)
@@ -1367,10 +1610,12 @@ void vr_set_hand_scale(float s) {
     g_hand_scale = s;
 }
 
-// Reflect the hand geometry to flip its apparent handedness (set when the controller drives Link's
-// opposite-side hand model). The game must also invert back-face culling for the mirrored hand.
-void vr_set_hand_mirror(bool mirror) {
-    g_hand_mirror = mirror;
+// Reflect that hand's geometry to flip its apparent handedness (set when the controller drives
+// Link's opposite-side hand model). The game must also invert back-face culling for a mirrored hand.
+void vr_set_hand_mirror(int hand, bool mirror) {
+    if (hand >= 0 && hand <= 1) {
+        g_hand_mirror[hand] = mirror;
+    }
 }
 
 // The game tags each hand limb's per-frame Mtx* (register) and clears the registry each game frame;
@@ -1400,44 +1645,65 @@ int16_t vr_get_head_yaw() {
     return static_cast<int16_t>(yaw / kPi * 32768.0f);
 }
 
-// Raw HMD yaw with the sign convention applied (OpenXR's yaw axis may be inverted vs game binang).
-static int16_t vr_mapped_head_yaw() {
-    int16_t raw = vr_get_head_yaw();
-    if (CVarGetInteger("gVrHeadingInvert", 0)) {
-        raw = static_cast<int16_t>(-raw);
-    }
-    return raw;
-}
-
 int16_t vr_get_heading_yaw() {
-    // Game-world heading = recenter offset + mapped HMD yaw + manual tuning offset (all binang).
+    if (!xr.initialized) return 0;
+    // Steering must match what the player SEES. The first-person view is composed from the raw HMD
+    // orientation — no recenter rotation is ever applied to the view — so the game-world look
+    // direction is fully determined by the HMD pose alone. Derive the heading from the HMD forward
+    // vector projected onto the horizontal plane: atan2(fx, fz) IS the game binang yaw (game yaw 0
+    // faces +Z; movement applies sin->x, cos->z). This replaces the old Euler-angle extraction +
+    // fudge constants, which skewed steering when the head pitched (up to ~15 deg looking down) and
+    // added a recenter offset the view never used — the "walking sideways" bug: movement rotated
+    // away from the look direction by (linkYaw - headYaw) captured at an arbitrary moment.
+    static int16_t s_last_heading = 0;
+    const XrQuaternionf& q = xr.views[0].pose.orientation;
+    const glm::quat gq(q.w, q.x, q.y, q.z);
+    const glm::vec3 fwd = gq * glm::vec3(0.0f, 0.0f, -1.0f);
+    if (fwd.x * fwd.x + fwd.z * fwd.z > 1e-6f) {
+        const float yaw = atan2f(fwd.x, fwd.z);
+        s_last_heading = static_cast<int16_t>(yaw * (32768.0f / 3.14159265358979323846f));
+    } // else: looking straight up/down, heading is degenerate — hold the last stable value
     const int16_t manual = static_cast<int16_t>(CVarGetInteger("gVrHeadingManualOffset", 0));
-    // Calibration constants (binang, 0x10000 = 360 deg):
-    //  - kForwardCorrection: OpenXR's forward axis is 180 deg opposed to the game's, so without it
-    //    the whole movement frame is reversed (forward<->back, left<->right).
-    //  - kSkewCorrection: measured ~30 deg rightward skew; -30 deg rotates movement back to center.
-    // Residual error can still be trimmed live with gVrHeadingManualOffset.
-    const int kForwardCorrection = 0x8000;  // 180 deg
-    const int kSkewCorrection = 1820;        // +10 deg: compensates a measured ~10 deg rightward skew
-    return static_cast<int16_t>(xr.heading_offset + vr_mapped_head_yaw() + manual + kForwardCorrection +
-                                kSkewCorrection);
+    return static_cast<int16_t>(s_last_heading + manual);
 }
 
 void vr_recenter_heading(int16_t link_yaw) {
-    // Capture the offset so the player's current physical facing maps to their in-game facing.
-    xr.heading_offset = static_cast<int16_t>(link_yaw - vr_mapped_head_yaw());
+    // Intentionally does NOT capture a steering offset anymore: the view never applies a recenter
+    // rotation, so steering must not either — any captured offset rotates movement away from the
+    // look direction (the old "walking sideways" bug). The game still calls this alongside
+    // VR_ResetRoomscale when first-person (re)starts; there is simply nothing to do for heading.
+    (void)link_yaw;
+    xr.heading_offset = 0;
 }
 
 void vr_rebind_current_eye_target() {
     if (!xr.initialized || !xr.frame_began) return;
 
-    auto& sc = xr.eye_swapchains[xr.current_eye];
-    uint32_t idx = xr.current_image_index[xr.current_eye];
-
-    ID3D11RenderTargetView* rtv = sc.rtvs[idx].Get();
-    ID3D11DepthStencilView* dsv = sc.dsvs[idx].Get();
+    // Restore whichever target is ACTUALLY being rendered: the flat-screen panel or the HUD when a
+    // 2D pass is active (the pause menu runs framebuffer copies mid-pass — blindly rebinding an eye
+    // here used to dump the inventory into the stale right-eye image), else the current eye.
+    ID3D11RenderTargetView* rtv;
+    ID3D11DepthStencilView* dsv;
+    uint32_t height;
+    if (xr.rendering_screen) {
+        auto& sc = xr.screen_swapchain;
+        rtv = sc.rtvs[xr.screen_image_index].Get();
+        dsv = sc.dsvs[xr.screen_image_index].Get();
+        height = sc.height;
+    } else if (xr.rendering_hud) {
+        auto& sc = xr.hud_swapchain;
+        rtv = sc.rtvs[xr.hud_image_index].Get();
+        dsv = sc.dsvs[xr.hud_image_index].Get();
+        height = sc.height;
+    } else {
+        auto& sc = xr.eye_swapchains[xr.current_eye];
+        uint32_t idx = xr.current_image_index[xr.current_eye];
+        rtv = sc.rtvs[idx].Get();
+        dsv = sc.dsvs[idx].Get();
+        height = sc.height;
+    }
     xr.d3d_context->OMSetRenderTargets(1, &rtv, dsv);
-    gfx_d3d11_set_render_target_height(sc.height);
+    gfx_d3d11_set_render_target_height(height);
 }
 
 // --------------------------------------------------------------------------
@@ -1488,6 +1754,74 @@ void vr_end_hud() {
 }
 
 bool vr_is_rendering_hud() { return xr.rendering_hud; }
+
+// --------------------------------------------------------------------------
+// Flat-screen mode (whole frame on a floating panel: file select, pause menu)
+// --------------------------------------------------------------------------
+
+void vr_set_flat_screen(bool enabled) {
+    xr.flat_screen = enabled;
+}
+
+bool vr_get_flat_screen() {
+    return xr.initialized && xr.flat_screen;
+}
+
+// Render the game's full frame into the screen swapchain. Reuses the HUD's "2D rendering" flag so
+// gfx_pc uses the normal flat projection instead of the per-eye VR overrides.
+void vr_begin_screen() {
+    if (!xr.initialized) return;
+    xr.rendering_hud = true; // gfx_pc's "2D target" flag: use the flat projection, not the VR eyes
+    xr.rendering_screen = true;
+
+    auto& sc = xr.screen_swapchain;
+    XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+    uint32_t image_index = 0;
+    xr_check(xrAcquireSwapchainImage(sc.handle, &acquire_info, &image_index), "xrAcquireSwapchainImage (screen)");
+    xr.screen_image_index = image_index;
+
+    XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+    wait_info.timeout = XR_INFINITE_DURATION;
+    xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage (screen)");
+
+    ID3D11RenderTargetView* rtv = sc.rtvs[image_index].Get();
+    ID3D11DepthStencilView* dsv = sc.dsvs[image_index].Get();
+    xr.d3d_context->OMSetRenderTargets(1, &rtv, dsv);
+
+    float clear_color[] = { 0.0f, 0.0f, 0.0f, 1.0f }; // Opaque black
+    xr.d3d_context->ClearRenderTargetView(rtv, clear_color);
+    xr.d3d_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    D3D11_VIEWPORT viewport = {};
+    viewport.Width = static_cast<float>(sc.width);
+    viewport.Height = static_cast<float>(sc.height);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    xr.d3d_context->RSSetViewports(1, &viewport);
+
+    gfx_d3d11_set_render_target_height(sc.height);
+}
+
+void vr_end_screen() {
+    if (!xr.initialized) return;
+    xr.rendering_hud = false;
+    xr.rendering_screen = false;
+
+    XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+    xr_check(xrReleaseSwapchainImage(xr.screen_swapchain.handle, &release_info), "xrReleaseSwapchainImage (screen)");
+}
+
+// Dimensions of whichever 2D target is currently being rendered (HUD quad or the flat-screen
+// panel), so gfx_pc sizes the frame to the actual texture instead of assuming the HUD's.
+void vr_get_2d_target_size(uint32_t* w, uint32_t* h) {
+    if (xr.rendering_screen) {
+        *w = xr.screen_swapchain.width;
+        *h = xr.screen_swapchain.height;
+    } else {
+        *w = xr.hud_swapchain.width;
+        *h = xr.hud_swapchain.height;
+    }
+}
 
 // --------------------------------------------------------------------------
 // Desktop mirror
@@ -1561,7 +1895,7 @@ bool vr_get_hand_matrix(int, float out[4][4]) {
     return false;
 }
 void vr_set_hand_scale(float) {}
-void vr_set_hand_mirror(bool) {}
+void vr_set_hand_mirror(int, bool) {}
 void vr_register_hand_matrix(const void*, int) {}
 void vr_clear_hand_matrices() {}
 bool vr_lookup_hand_matrix(const void*, float out[4][4]) {
@@ -1580,6 +1914,11 @@ void* vr_get_hud_commands() { return nullptr; }
 void vr_begin_hud() {}
 void vr_end_hud() {}
 bool vr_is_rendering_hud() { return false; }
+void vr_set_flat_screen(bool) {}
+bool vr_get_flat_screen() { return false; }
+void vr_begin_screen() {}
+void vr_end_screen() {}
+void vr_get_2d_target_size(uint32_t* w, uint32_t* h) { *w = 1024; *h = 768; }
 void vr_capture_mirror() {}
 void* vr_get_mirror_texture_id() { return nullptr; }
 

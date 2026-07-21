@@ -10,6 +10,12 @@ extern "C" {
 bool VR_IsInitialized();
 void VR_SetOverlayDisplayList(void* commands);
 
+// Flat-screen (2D) contexts — file select, pause menu. While enabled, the frame renders onto a
+// world-locked floating panel placed in front of the player (instead of the stereo world), and the
+// last world frame stays frozen-but-head-tracked behind it. The game sets this every frame.
+void VR_SetFlatScreen(bool enabled);
+bool VR_IsFlatScreen(void);
+
 // First-person camera (game-side integration).
 // The game pushes Link's head position each frame as the world-space anchor;
 // the VR layer composes the view as anchor + HMD offset/orientation.
@@ -77,9 +83,11 @@ bool     VR_GetHandMatrix(int hand, float out[4][4]);
 // registry each frame, then tag each hand limb's Mtx* so gfx_pc replaces it with the live controller
 // pose per eye (full headset rate, no game-rate judder).
 void     VR_SetHandScale(float s);
-// Reflect the hand geometry to flip handedness (when a controller drives Link's opposite-side hand
-// model). The game must also invert back-face culling for the mirrored hand. Axis via gVrHandMirrorAxis.
-void     VR_SetHandMirror(bool mirror);
+// Reflect that hand's geometry to flip handedness (when a controller drives Link's opposite-side hand
+// model). Per hand: reflecting also mirrors held items' face designs (e.g. the shield crest), so the
+// shield hand typically stays unmirrored. The game must also invert back-face culling for a mirrored
+// hand. Axis via gVrHandMirrorAxis.
+void     VR_SetHandMirror(int hand, bool mirror);
 void     VR_RegisterHandMatrix(const void* mtx, int hand);
 void     VR_ClearHandMatrices(void);
 

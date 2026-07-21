@@ -4291,8 +4291,8 @@ void gfx_start_frame() {
     if (vr_is_initialized()) {
         uint32_t vr_w, vr_h;
         if (vr_is_rendering_hud()) {
-            vr_w = 1024;
-            vr_h = 768;
+            // Size the frame to the actual 2D target (HUD quad or flat-screen panel).
+            vr_get_2d_target_size(&vr_w, &vr_h);
         } else {
             vr_get_recommended_resolution(&vr_w, &vr_h);
         }

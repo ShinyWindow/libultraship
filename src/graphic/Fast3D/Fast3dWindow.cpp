@@ -183,11 +183,21 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
             return true;
         }
 
-        for (int eye = 0; eye < 2; eye++) {
-            vr_begin_eye(eye);
+        if (vr_get_flat_screen()) {
+            // 2D context (file select, pause): render the whole frame onto the floating panel.
+            // The eye swapchains keep their last world frame; vr_end_frame re-submits it with its
+            // original pose so the frozen world stays world-locked behind the panel.
+            vr_begin_screen();
             gfx_start_frame();
             gfx_run(commands, mtxReplacements);
-            vr_end_eye(eye);
+            vr_end_screen();
+        } else {
+            for (int eye = 0; eye < 2; eye++) {
+                vr_begin_eye(eye);
+                gfx_start_frame();
+                gfx_run(commands, mtxReplacements);
+                vr_end_eye(eye);
+            }
         }
 
         // Render HUD overlay to separate texture (once, not per-eye)
