@@ -372,3 +372,5 @@ extern/nlohmann-json/*_jsonConfig*
 *.xcworkspace
 *.xcsettings
 build*
+# Stale OpenVR-era checkout, not part of the build
+/external/

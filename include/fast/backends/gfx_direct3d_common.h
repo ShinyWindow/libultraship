@@ -145,6 +145,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilState;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
+    // Ring-allocation cursor into mVertexBuffer, in bytes. Each DrawTriangles appends at the cursor
+    // with MAP_WRITE_NO_OVERWRITE and only pays for a buffer rename (MAP_WRITE_DISCARD) when the
+    // cursor wraps, instead of renaming on every single draw.
+    uint32_t mVertexBufferOffset = 0;
+    uint32_t mVertexBufferCapacity = 0;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerPrimDepthCb;
@@ -185,7 +190,6 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Previous states (to prevent setting states needlessly)
 
     struct ShaderProgramD3D11* mLastShaderProgram = nullptr;
-    uint32_t mLastVertexBufferStride = 0;
     Microsoft::WRL::ComPtr<ID3D11BlendState> mLastBlendState = nullptr;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mLastResourceViews[SHADER_MAX_TEXTURES] = { nullptr, nullptr };
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mLastSamplerStates[SHADER_MAX_TEXTURES] = { nullptr, nullptr };

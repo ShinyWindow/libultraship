@@ -15,7 +15,10 @@
 
 #include "fast/Fast3dGui.h"
 #include "fast/vr_openxr.h"
+#include "libultraship/bridge/consolevariablebridge.h"
 
+#include <algorithm>
+#include <chrono>
 #include <fstream>
 
 namespace Fast {
@@ -115,7 +118,11 @@ void Fast3dWindow::Init() {
         CVAR_TEXTURE_FILTER, FILTER_THREE_POINT));
 
     // SOH [VR] Must run after Interpreter::Init — the OpenXR session binds the D3D11 device.
-    vr_init();
+    // With VR mode off, skip entirely: no OpenXR session is created (and no SteamVR launch) until
+    // the player toggles VR on (vr_apply_mode_request lazily initializes).
+    if (CVarGetInteger("gVrEnabled", 1)) {
+        vr_init();
+    }
 }
 
 int32_t Fast3dWindow::GetTargetFps() {
@@ -201,63 +208,147 @@ bool Fast3dWindow::IsFrameReady() {
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
     std::shared_ptr<Window> wnd = Ship::Context::GetRawInstance()->GetWindow();
 
-    // Skip dropped frames
-    if (!wnd->IsFrameReady()) {
+    const bool vr = vr_is_initialized();
+
+    // Skip dropped frames.
+    // SOH [VR] Not in VR: there, xrWaitFrame is the frame pacer, and this limiter is a second one
+    // running off the DESKTOP swapchain's statistics. Worse, a "drop" here returns before any XR
+    // call, so the whole frame — wait, begin and end — is skipped and the compositor is left to
+    // reproject a stale frame. Let OpenXR decide the cadence.
+    if (!vr && !wnd->IsFrameReady()) {
         return false;
+    }
+
+    const auto frameStart = std::chrono::steady_clock::now();
+    auto elapsedMsSince = [](std::chrono::steady_clock::time_point since) {
+        return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - since).count();
+    };
+
+    // SOH [VR] Decide up front which of this frame's expensive jobs actually run. vr_begin_frame
+    // latches its submit poses from this, so it has to be set before the frame opens.
+    bool renderEyes = true;
+    bool renderHud = true;
+    bool presentDesktop = true;
+    if (vr) {
+        const uint64_t stereoDivisor = (uint64_t)std::clamp(CVarGetInteger("gVrStereoDivisor", 1), 1, 4);
+        const uint64_t desktopDivisor = (uint64_t)std::clamp(CVarGetInteger("gVrDesktopViewDivisor", 4), 1, 32);
+
+        // Redraw the stereo pair every Nth XR frame; the frames in between resubmit the previous
+        // images and let the compositor reproject them onto the live head pose. Head tracking
+        // stays at full rate, only world animation drops to refresh/N.
+        renderEyes = (mVrFrameCounter % stereoDivisor) == 0u;
+
+        // Entering or leaving a 2D context swaps which target holds the visible image, so force a
+        // redraw on the transition rather than showing a stale panel (or a stale world behind it)
+        // for up to a divisor's worth of frames.
+        const bool flatScreen = vr_get_flat_screen();
+        if (flatScreen != mVrFlatScreenPrev) {
+            mVrFlatScreenPrev = flatScreen;
+            renderEyes = true;
+        }
+
+        // The overlay display list is rebuilt once per 20 Hz game tick, so redrawing it on every
+        // interpolated sub-frame renders byte-identical content up to six times at 120 Hz.
+        // mInterpolationIndex == 0 marks a tick's first sub-frame (set in soh's RunCommands).
+        renderHud = !CVarGetInteger("gVrHudPerTick", 1) || mInterpreter->mInterpolationIndex == 0;
+
+        // The companion window is a courtesy view. Presenting it every XR frame costs an ImGui
+        // frame, a full-eye-resolution mirror blit and a desktop Present, all on the critical path.
+        presentDesktop = (mVrFrameCounter % desktopDivisor) == 0u;
+
+        mVrFrameCounter++;
+        vr_set_frame_plan(renderEyes, renderHud, presentDesktop);
     }
 
     auto gui = wnd->GetGui();
     // Setup mouse state manager
     wnd->GetMouseStateManager()->StartFrame();
     // Setup of the backend frames and draw initial Window and GUI menus
-    gui->StartDraw();
+    if (presentDesktop) {
+        gui->StartDraw();
+    }
     // Setup game framebuffers to match available window space
     mInterpreter->StartFrame();
+
+    float eyesMs = 0.0f;
+    float hudMs = 0.0f;
+    float desktopMs = 0.0f;
 
     // SOH [VR] Stereo path: run the interpreter once per eye into the OpenXR swapchains (or once
     // onto the flat-screen panel for 2D contexts), render the HUD quad, submit the XR frame, then
     // let the GUI composite the desktop companion view from the VR mirror texture.
-    if (vr_is_initialized()) {
+    if (vr) {
         // The port sets mInterpolationT per sub-frame (see soh RunCommands); mirror it into the VR
         // layer so the camera anchor interpolates in lockstep with the interpolated world.
         vr_set_interp_alpha(mInterpreter->mInterpolationT);
         if (vr_begin_frame()) {
-            if (vr_get_flat_screen()) {
-                // 2D context (file select, pause): whole frame onto the world-locked panel; the
-                // eye swapchains keep their last world frame, resubmitted with its original pose.
-                vr_begin_screen();
-                mInterpreter->Run(commands, mtxReplacements);
-                vr_end_screen();
-            } else {
-                for (int eye = 0; eye < 2; eye++) {
-                    vr_begin_eye(eye);
+            // The divisor covers the flat-screen panel as well as the stereo pair: it is a quad
+            // layer at a fixed pose showing a menu, so the compositor resubmits it perfectly and
+            // there is even less to lose than with the eyes.
+            if (renderEyes) {
+                const auto eyesStart = std::chrono::steady_clock::now();
+                if (vr_get_flat_screen()) {
+                    // 2D context (file select, pause): whole frame onto the world-locked panel; the
+                    // eye swapchains keep their last world frame, resubmitted with its original pose.
+                    vr_begin_screen();
                     mInterpreter->Run(commands, mtxReplacements);
-                    vr_end_eye(eye);
+                    vr_end_screen();
+                } else {
+                    for (int eye = 0; eye < 2; eye++) {
+                        vr_begin_eye(eye);
+                        mInterpreter->Run(commands, mtxReplacements);
+                        vr_end_eye(eye);
+                    }
                 }
+                eyesMs = elapsedMsSince(eyesStart);
             }
 
             // Head-locked HUD overlay (rendered once, not per-eye)
             Gfx* hudCommands = static_cast<Gfx*>(vr_get_hud_commands());
-            if (hudCommands != nullptr) {
+            if (hudCommands != nullptr && renderHud) {
+                const auto hudStart = std::chrono::steady_clock::now();
                 vr_begin_hud();
                 mInterpreter->Run(hudCommands, mtxReplacements);
                 vr_end_hud();
+                hudMs = elapsedMsSince(hudStart);
             }
 
             vr_end_frame();
         }
 
-        // Desktop companion window: the GUI's game-image composite reads mGfxFrameBuffer; point it
-        // at the VR mirror (left eye copy) since the game never rendered into mGameFb.
-        mInterpreter->mGfxFrameBuffer = (uintptr_t)vr_get_mirror_texture_id();
+        if (presentDesktop) {
+            // Return to the WINDOW backbuffer for the GUI composite. In VR no Run pass resolves
+            // into framebuffer 0 (the eyes render into XR swapchains and skip the non-VR exit path
+            // that binds + clears it), so without this ImGui draws onto whatever XR target was
+            // bound last — already released to the runtime — and the desktop window stays blank.
+            mRenderingApi->StartDrawToFramebuffer(0, 1);
+            mRenderingApi->ClearFramebuffer(true, true);
+
+            // Desktop companion window: the GUI's game-image composite reads mGfxFrameBuffer; point
+            // it at the VR mirror (left eye copy) since the game never rendered into mGameFb.
+            mInterpreter->mGfxFrameBuffer = (uintptr_t)vr_get_mirror_texture_id();
+        }
     } else {
         // Execute the games gfx commands
         mInterpreter->Run(commands, mtxReplacements);
     }
-    // Renders the game frame buffer to the final window and finishes the GUI
-    gui->EndDraw();
-    // Finalize swap buffers
-    mInterpreter->EndFrame();
+
+    if (presentDesktop) {
+        const auto desktopStart = std::chrono::steady_clock::now();
+        // Renders the game frame buffer to the final window and finishes the GUI
+        gui->EndDraw();
+        // Finalize swap buffers
+        mInterpreter->EndFrame();
+        desktopMs = elapsedMsSince(desktopStart);
+    } else {
+        // Companion window skipped this frame. Still kick the queued GPU work — the XR compositor
+        // is the consumer now — but leave the desktop swapchain alone.
+        mRenderingApi->EndFrame();
+    }
+
+    if (vr) {
+        vr_report_frame_times(eyesMs, hudMs, desktopMs, elapsedMsSince(frameStart), renderEyes);
+    }
 
     return true;
 }

@@ -101,5 +101,8 @@ class Fast3dWindow : public Ship::Window {
     GfxWindowBackend* mWindowManagerApi;
     std::shared_ptr<Interpreter> mInterpreter = nullptr;
     std::shared_ptr<GfxDebugger> mGfxDebugger;
+    // Counts submitted XR frames; drives the stereo and companion-window divisors.
+    uint64_t mVrFrameCounter = 0;
+    bool mVrFlatScreenPrev = false;
 };
 } // namespace Fast

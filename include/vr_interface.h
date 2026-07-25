@@ -8,7 +8,17 @@ extern "C" {
 #endif
 
 bool VR_IsInitialized();
+// Latch a pending VR<->flat mode toggle (CVar gVrEnabled). The game calls this once per game tick,
+// BEFORE building the tick's display list, so a DL built for one mode is never drawn in the other.
+void VR_ApplyModeRequest(void);
 void VR_SetOverlayDisplayList(void* commands);
+
+// Bracket the game's fixed-timestep logic update so the VR performance readout can separate it
+// from render cost. Game logic runs once per 20 Hz tick on the same thread as the render passes,
+// so its cost comes straight out of that tick's render budget; seeing it split out is the whole
+// point. No-ops when VR is inactive.
+void VR_GameTickBegin(void);
+void VR_GameTickEnd(void);
 
 // Flat-screen (2D) contexts — file select, pause menu. While enabled, the frame renders onto a
 // world-locked floating panel placed in front of the player (instead of the stereo world), and the
@@ -22,6 +32,9 @@ bool VR_IsFlatScreen(void);
 void VR_SetFirstPerson(bool enabled);
 bool VR_GetFirstPerson(void);
 void VR_SetCameraAnchor(float x, float y, float z);
+// Third person: the game camera's facing (binang yaw) becomes the playspace's base orientation,
+// so looking straight ahead in the headset looks where the stock camera looks (cutscenes too).
+void VR_SetCameraYaw(int16_t yaw_binang);
 
 // HMD yaw as a binary angle (binang), for driving gameplay heading. (Phase 2)
 int16_t VR_GetHeadYaw(void);

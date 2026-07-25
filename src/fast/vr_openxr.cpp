@@ -8,6 +8,7 @@
 #include <string>
 #include <cstring>
 #include <cmath>
+#include <chrono>
 #include <unordered_map>
 
 #include <d3d11.h>
@@ -85,6 +86,14 @@ static void vr_apply_dimensions(uint32_t width, uint32_t height) {
     }
 }
 
+// Leave mCurDimensions at the eye size after any 2D pass (HUD quad, flat-screen panel), so it is
+// the SAME at every Interpreter::StartFrame regardless of which passes a given frame ran.
+// StartFrame reconfigures mGameFb from mCurDimensions unconditionally and re-scales every
+// resizable framebuffer whenever it changed since last frame; letting the value alternate between
+// eye size and a 2D target's size makes it tear down and reallocate eye-resolution textures
+// several times per game tick. Cheap invariant, expensive to get wrong.
+static void vr_restore_eye_dimensions();
+
 // --------------------------------------------------------------------------
 // Internal state
 // --------------------------------------------------------------------------
@@ -136,6 +145,13 @@ static struct {
     glm::vec3 anchor;         // Link's head this game frame, in game/world units (set by the game)
     glm::vec3 anchor_prev;    // Link's head the previous game frame (for sub-frame interpolation)
     bool anchor_initialized;  // False until the first anchor is pushed
+    // Base yaw of the anchored playspace frame, stored as gamma = pi - cameraYaw (the world-to-
+    // tracking rotation angle; 0 = world-aligned, which is first-person's frame). Third person
+    // pushes the game camera's yaw each tick so facing tracking-forward looks where the game
+    // camera looks; pitch/roll are intentionally NOT folded in (the horizon must stay level with
+    // real gravity — a tilted horizon is instant motion sickness).
+    float anchor_gamma;
+    float anchor_gamma_prev;
     float interp_alpha;       // 0..1 blend between anchor_prev and anchor for the current render pass
     int16_t heading_offset;   // binang offset mapping HMD yaw -> game-world yaw (set at recenter)
 
@@ -163,10 +179,19 @@ static struct {
     // Raw located view poses, preserved for compositor submission. The game-facing poses in `views`
     // get the artificial snap-turn applied; the compositor must instead see the physical head pose
     // the rendered image corresponds to (the turn is a world-space change, not a head-pose change).
+    // submit_fov is latched alongside so a resubmitted (not re-rendered) eye image is described by
+    // the frustum it was actually drawn with.
     XrPosef submit_pose[2];
+    XrFovf submit_fov[2];
+
+    // Frame plan for the current XR frame (see vr_set_frame_plan).
+    bool plan_render_eyes;
+    bool plan_render_hud;
+    bool plan_present_desktop;
     // Per-frame controller state (raw, in OpenXR local space)
     bool hand_active[2];
     XrPosef grip_pose[2];
+    XrPosef grip_pose_raw[2]; // untouched by snap-turn; for compositor-space quads (hand HUD)
     XrPosef aim_pose[2];
     float trigger_value[2];
     float squeeze_value[2];
@@ -190,7 +215,9 @@ static struct {
     struct EyeSwapchain screen_swapchain;
     uint32_t screen_image_index;
     bool rendering_screen;   // currently rendering into the screen swapchain (vs the HUD's)
-    bool eyes_ever_rendered; // don't submit the projection layer before its swapchains have content
+    bool eyes_ever_rendered;   // don't submit the projection layer before its swapchains have content
+    bool hud_ever_rendered;    // likewise for the HUD quad — its swapchain starts uninitialised
+    bool screen_ever_rendered; // and for the flat-screen panel
 
     // Desktop mirror: a copy of the left eye for display in the companion window. We can't sample the
     // swapchain image directly at present time (the runtime owns it once released), so the left eye is
@@ -203,7 +230,24 @@ static struct {
     ID3D11DeviceContext* d3d_context;
 
     bool initialized;
+    // Runtime VR<->flat toggle. `initialized` means the OpenXR session exists; `enabled` means the
+    // mod is actively driving it. Disabled-with-session = flat gameplay with the headset idle,
+    // ready to resume instantly. All game-facing predicates check both.
+    bool enabled;
+    bool reenable_fixup; // one-shot: re-zero roomscale on the first located frame after re-enable
+
+    // Headset presence (XR_EXT_user_presence proximity-sensor events). When the extension is
+    // unavailable the feature is inert: user_present stays true and doffing changes nothing.
+    bool user_presence_supported;
+    bool user_present;
 } xr = {};
+
+static void vr_restore_eye_dimensions() {
+    const auto& sc = xr.eye_swapchains[0];
+    if (sc.width > 0 && sc.height > 0) {
+        vr_apply_dimensions(sc.width, sc.height);
+    }
+}
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -306,6 +350,12 @@ static void poll_events() {
         if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             auto* state_event = reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
             handle_session_state_change(state_event->state);
+        } else if (event.type == XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT) {
+            // Proximity sensor: headset donned/doffed. The runtime also posts the initial state
+            // right after the session starts.
+            auto* presence_event = reinterpret_cast<XrEventDataUserPresenceChangedEXT*>(&event);
+            xr.user_present = (presence_event->isUserPresent == XR_TRUE);
+            spdlog::info("[VR] Headset {}", xr.user_present ? "donned" : "doffed");
         }
         event = { XR_TYPE_EVENT_DATA_BUFFER };
     }
@@ -570,6 +620,12 @@ bool vr_init() {
     xr.world_scale = 35.0f;
     xr.near_clip = 10.0f;
     xr.far_clip = 30000.0f;
+
+    // Default the frame plan to "do everything"; the window layer overrides it per frame. Without
+    // this the zero-initialised flags would suppress every pass until the first vr_set_frame_plan.
+    xr.plan_render_eyes = true;
+    xr.plan_render_hud = true;
+    xr.plan_present_desktop = true;
     xr.roomscale_origin = glm::vec2(0.0f);
 
     // Per-eye resolution multiplier. Runtimes (esp. SteamVR) often bake a supersampling
@@ -584,7 +640,23 @@ bool vr_init() {
     xr.refresh_rate = 90;
 
     // --- Create Instance ---
-    const char* extensions[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
+    // Optional extensions are enabled only when the runtime offers them.
+    xr.user_presence_supported = false;
+    xr.user_present = true; // assume worn until the runtime says otherwise
+    {
+        uint32_t ext_count = 0;
+        xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr);
+        std::vector<XrExtensionProperties> ext_props(ext_count, { XR_TYPE_EXTENSION_PROPERTIES });
+        xrEnumerateInstanceExtensionProperties(nullptr, ext_count, &ext_count, ext_props.data());
+        for (const auto& p : ext_props) {
+            if (strcmp(p.extensionName, XR_EXT_USER_PRESENCE_EXTENSION_NAME) == 0) {
+                xr.user_presence_supported = true;
+            }
+        }
+    }
+
+    const char* extensions[2] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME, XR_EXT_USER_PRESENCE_EXTENSION_NAME };
+    const uint32_t extension_count = xr.user_presence_supported ? 2 : 1;
 
     XrInstanceCreateInfo instance_ci = { XR_TYPE_INSTANCE_CREATE_INFO };
     strcpy(instance_ci.applicationInfo.applicationName, "Ship of Harkinian VR");
@@ -592,7 +664,7 @@ bool vr_init() {
     strcpy(instance_ci.applicationInfo.engineName, "libultraship");
     instance_ci.applicationInfo.engineVersion = 1;
     instance_ci.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-    instance_ci.enabledExtensionCount = 1;
+    instance_ci.enabledExtensionCount = extension_count;
     instance_ci.enabledExtensionNames = extensions;
 
     if (!xr_check(xrCreateInstance(&instance_ci, &xr.instance), "xrCreateInstance")) {
@@ -959,6 +1031,7 @@ bool vr_init() {
     xr.views[1] = { XR_TYPE_VIEW };
 
     xr.initialized = true;
+    xr.enabled = true;
     spdlog::info("[VR] OpenXR initialized successfully");
     return true;
 }
@@ -1020,17 +1093,88 @@ void vr_shutdown() {
 // Per-frame
 // --------------------------------------------------------------------------
 
+// --------------------------------------------------------------------------
+// Frame plan + timing
+// --------------------------------------------------------------------------
+
+void vr_set_frame_plan(bool render_eyes, bool render_hud, bool present_desktop) {
+    xr.plan_render_eyes = render_eyes;
+    xr.plan_render_hud = render_hud;
+    xr.plan_present_desktop = present_desktop;
+}
+
+bool vr_should_render_eyes() { return xr.plan_render_eyes; }
+bool vr_should_render_hud() { return xr.plan_render_hud; }
+bool vr_should_present_desktop() { return xr.plan_present_desktop; }
+
+namespace {
+
+VrFrameStats g_stats = {};
+// Rate counters: count events, convert to Hz once a second so the readout is stable.
+int g_eye_pass_count = 0;
+int g_frame_count = 0;
+std::chrono::steady_clock::time_point g_rate_epoch = std::chrono::steady_clock::now();
+
+// Exponential smoothing. Frame times at 120 Hz are noisy enough that an unsmoothed readout is
+// unreadable; ~0.05 settles in well under a second while still showing spikes.
+inline void smooth(float& acc, float sample) {
+    acc += (sample - acc) * 0.05f;
+}
+
+} // namespace
+
+void vr_report_frame_times(float eyes_ms, float hud_ms, float desktop_ms, float frame_ms, bool rendered_eyes) {
+    // Only fold an eye-pass sample in on frames that actually ran one, or the average decays toward
+    // zero on reprojection-only frames and stops meaning "cost of an eye pass".
+    if (rendered_eyes) {
+        smooth(g_stats.eyes_ms, eyes_ms);
+        g_eye_pass_count++;
+    }
+    if (hud_ms > 0.0f) {
+        smooth(g_stats.hud_ms, hud_ms);
+    }
+    if (desktop_ms > 0.0f) {
+        smooth(g_stats.desktop_ms, desktop_ms);
+    }
+    smooth(g_stats.frame_ms, frame_ms);
+    g_frame_count++;
+
+    const auto now = std::chrono::steady_clock::now();
+    const float elapsed = std::chrono::duration<float>(now - g_rate_epoch).count();
+    if (elapsed >= 1.0f) {
+        g_stats.eye_hz = g_eye_pass_count / elapsed;
+        g_stats.frame_hz = g_frame_count / elapsed;
+        g_eye_pass_count = 0;
+        g_frame_count = 0;
+        g_rate_epoch = now;
+    }
+}
+
+void vr_report_game_tick_ms(float tick_ms) {
+    smooth(g_stats.tick_ms, tick_ms);
+}
+
+void vr_get_frame_stats(VrFrameStats* out) {
+    if (out != nullptr) {
+        *out = g_stats;
+    }
+}
+
 bool vr_begin_frame() {
-    if (!xr.initialized) return false;
+    if (!xr.initialized || !xr.enabled) return false;
 
     poll_events();
 
     if (!xr.session_running) return false;
 
-    // Wait for the runtime to signal it's ready for a new frame
+    // Wait for the runtime to signal it's ready for a new frame. Time spent blocked here is spare
+    // headroom — if it trends to zero we are no longer keeping up with the headset.
     xr.frame_state = { XR_TYPE_FRAME_STATE };
     XrFrameWaitInfo wait_info = { XR_TYPE_FRAME_WAIT_INFO };
-    if (!xr_check(xrWaitFrame(xr.session, &wait_info, &xr.frame_state), "xrWaitFrame")) {
+    const auto wait_start = std::chrono::steady_clock::now();
+    const XrResult wait_result = xrWaitFrame(xr.session, &wait_info, &xr.frame_state);
+    smooth(g_stats.wait_ms, std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - wait_start).count());
+    if (!xr_check(wait_result, "xrWaitFrame")) {
         return false;
     }
 
@@ -1079,6 +1223,14 @@ bool vr_begin_frame() {
     // Sync controllers + locate hand poses for this frame (motion controls).
     update_input();
 
+    // Re-enable fixup: the player may have physically moved while playing flat, so map their
+    // CURRENT position to Link's current body — otherwise the stale roomscale origin makes Link
+    // glide off to wherever the player wandered. Needs this frame's freshly located views.
+    if (xr.reenable_fixup) {
+        xr.reenable_fixup = false;
+        vr_reset_roomscale();
+    }
+
     // Flat-screen panel placement: on entering a 2D context, drop the panel in front of the
     // player's current gaze. Uses the RAW located pose — quad layers are submitted in local_space
     // and never include the artificial snap-turn.
@@ -1104,9 +1256,10 @@ bool vr_begin_frame() {
     xr.flat_screen_prev = xr.flat_screen;
 
     // Snap turn (right stick X): latch a discrete turn on a threshold crossing; the stick must
-    // return to center before the next snap fires. Suspended in flat-screen mode, where the right
-    // stick navigates menus (C-buttons) instead.
-    if (xr.input_initialized && !xr.flat_screen && CVarGetInteger("gVrSnapTurnOn", 1)) {
+    // return to center before the next snap fires. Suspended in flat-screen mode (right stick
+    // navigates menus) and in third person (the stock game owns the camera and the right stick is
+    // pure C-buttons — no artificial rotation exists in that mode).
+    if (xr.input_initialized && !xr.flat_screen && xr.first_person && CVarGetInteger("gVrSnapTurnOn", 1)) {
         static int snap_latch = 0;
         const float sx = xr.thumbstick_x[1];
         if (snap_latch == 0 && fabsf(sx) > 0.6f) {
@@ -1119,17 +1272,24 @@ bool vr_begin_frame() {
 
     // Apply the accumulated snap-turn to every game-facing pose, preserving the raw view poses for
     // layer submission in vr_end_frame. Hand poses are only adjusted when freshly located this frame
-    // (a stale pose already carries the previous turn and would be double-rotated). In flat-screen
-    // mode the submit poses are NOT refreshed: the projection layer keeps re-submitting the last
-    // world frame with the pose it was rendered from, so the frozen world stays world-locked.
+    // (a stale pose already carries the previous turn and would be double-rotated). The submit
+    // pose/FOV are refreshed ONLY on frames whose eye images we are about to redraw: in flat-screen
+    // mode, and on stereo-divisor reprojection frames, the projection layer keeps re-submitting the
+    // last world frame described by the frustum it was rendered from, so the compositor reprojects
+    // it correctly instead of stretching it onto a pose it never matched.
+    const bool refresh_submit = !xr.flat_screen && xr.plan_render_eyes;
     for (int eye = 0; eye < 2; eye++) {
-        if (!xr.flat_screen) {
+        if (refresh_submit || !xr.eyes_ever_rendered) {
             xr.submit_pose[eye] = xr.views[eye].pose;
+            xr.submit_fov[eye] = xr.views[eye].fov;
         }
         xr.views[eye].pose = apply_turn(xr.views[eye].pose);
     }
     for (int h = 0; h < 2; h++) {
         if (xr.hand_active[h]) {
+            // Keep the RAW tracking-space grip for compositor quads (hand-attached HUD): quad
+            // layers are composed against live tracking and must not carry the artificial turn.
+            xr.grip_pose_raw[h] = xr.grip_pose[h];
             xr.grip_pose[h] = apply_turn(xr.grip_pose[h]);
             xr.aim_pose[h] = apply_turn(xr.aim_pose[h]);
         }
@@ -1154,7 +1314,7 @@ void vr_end_frame() {
         // Submit the RAW physical pose, not the turn-adjusted one — reprojection must compare
         // against where the player's head actually is, or the compositor would fight the snap turn.
         projection_views[eye].pose = xr.submit_pose[eye];
-        projection_views[eye].fov = xr.views[eye].fov;
+        projection_views[eye].fov = xr.submit_fov[eye];
         projection_views[eye].subImage.swapchain = xr.eye_swapchains[eye].handle;
         projection_views[eye].subImage.imageRect.offset = { 0, 0 };
         projection_views[eye].subImage.imageRect.extent = {
@@ -1169,10 +1329,12 @@ void vr_end_frame() {
     projection_layer.viewCount = 2;
     projection_layer.views = projection_views;
 
-    // HUD quad layer (head-locked, alpha-blended)
+    // HUD quad layer (alpha-blended). Attachment via gVrHudAttach: 0 = head-locked (classic),
+    // 1/2 = pinned to the left/right controller like a wrist panel. Hand modes use the RAW grip
+    // pose in local_space (compositor quads must not carry the artificial snap-turn) and fall back
+    // to head-locked while that hand is untracked.
     XrCompositionLayerQuad hud_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
     hud_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-    hud_layer.space = xr.view_space;
     hud_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     hud_layer.subImage.swapchain = xr.hud_swapchain.handle;
     hud_layer.subImage.imageRect.offset = { 0, 0 };
@@ -1181,8 +1343,40 @@ void vr_end_frame() {
         static_cast<int32_t>(xr.hud_swapchain.height)
     };
     hud_layer.subImage.imageArrayIndex = 0;
-    hud_layer.pose = { { 0, 0, 0, 1 }, { 0, 0, -2.0f } };
-    hud_layer.size = { 1.5f, 1.125f };
+
+    float hud_width;
+    const int hud_attach = CVarGetInteger("gVrHudAttach", 0);
+    const int hud_hand = hud_attach - 1;
+    if ((hud_attach == 1 || hud_attach == 2) && xr.hand_active[hud_hand]) {
+        const float kDeg = 3.14159265358979323846f / 180.0f;
+        const XrPosef& gp = xr.grip_pose_raw[hud_hand];
+        const glm::quat gq(gp.orientation.w, gp.orientation.x, gp.orientation.y, gp.orientation.z);
+        // Positional offset in the grip frame (meters), mirrored in X for the right hand so one
+        // tuning works symmetrically on either side.
+        glm::vec3 off(CVarGetFloat("gVrHudHandOffX", 0.0f), CVarGetFloat("gVrHudHandOffY", 0.10f),
+                      CVarGetFloat("gVrHudHandOffZ", -0.08f));
+        if (hud_hand == 1) {
+            off.x = -off.x;
+        }
+        const glm::vec3 p = glm::vec3(gp.position.x, gp.position.y, gp.position.z) + gq * off;
+        // Tilt about the grip X axis so the panel faces the player's eyes at a natural wrist angle.
+        const glm::quat q =
+            gq * glm::angleAxis(CVarGetFloat("gVrHudHandPitch", -40.0f) * kDeg, glm::vec3(1.0f, 0.0f, 0.0f));
+        hud_layer.space = xr.local_space;
+        hud_layer.pose.position = { p.x, p.y, p.z };
+        hud_layer.pose.orientation = { q.x, q.y, q.z, q.w };
+        hud_width = CVarGetFloat("gVrHudHandSize", 0.35f);
+    } else {
+        hud_layer.space = xr.view_space;
+        hud_layer.pose = { { 0, 0, 0, 1 },
+                           { CVarGetFloat("gVrHudOffX", 0.0f), CVarGetFloat("gVrHudOffY", 0.0f),
+                             -CVarGetFloat("gVrHudDistance", 2.0f) } };
+        hud_width = CVarGetFloat("gVrHudSize", 1.5f);
+    }
+    if (hud_width < 0.05f) {
+        hud_width = 0.05f;
+    }
+    hud_layer.size = { hud_width, hud_width * 0.75f }; // 4:3, matching the HUD swapchain
 
     // Flat-screen quad (world-locked panel with the whole 2D frame: file select, pause menu)
     XrCompositionLayerQuad screen_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
@@ -1209,10 +1403,14 @@ void vr_end_frame() {
     if (xr.eyes_ever_rendered) {
         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection_layer);
     }
-    if (xr.flat_screen) {
+    if (xr.flat_screen && xr.screen_ever_rendered) {
         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&screen_layer);
     }
-    layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud_layer);
+    // Same guard as the projection layer: the HUD quad's swapchain is uninitialised until the
+    // first HUD pass, and with per-tick HUD rendering that may be a few frames in.
+    if (xr.hud_ever_rendered) {
+        layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud_layer);
+    }
 
     XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
     end_info.displayTime = xr.frame_state.predictedDisplayTime;
@@ -1281,8 +1479,10 @@ void vr_end_eye(int eye) {
     if (!xr.initialized) return;
 
     // Grab the left eye for the desktop mirror while its swapchain image is still acquired — once
-    // released below, the runtime owns the texture again and it's no longer safe to read.
-    if (eye == 0) {
+    // released below, the runtime owns the texture again and it's no longer safe to read. Skipped
+    // on frames the companion window isn't presenting: this is a full-eye-resolution CopyResource
+    // (tens of MB) and nothing would consume the result.
+    if (eye == 0 && xr.plan_present_desktop) {
         vr_capture_mirror();
     }
 
@@ -1301,26 +1501,40 @@ void vr_get_projection_matrix(int eye, float out[4][4]) {
 
 void vr_get_view_matrix(int eye, float out[4][4]) {
     const float (*v)[4] = xr.view[eye];
-    if (!xr.first_person) {
+    if (!xr.anchor_initialized) {
         memcpy(out, v, sizeof(float) * 16);
         return;
     }
-    // First-person: anchored_view = T(-anchor) * view  (row-vector convention).
-    // Pre-translating the world by -anchor places Link's head at the OpenXR local-space
-    // origin, so the HMD's positional offset reads relative to Link's head and orientation
-    // stays pure-HMD. Anchor is in game units, matching the world_scale-scaled HMD translation.
-    // Rows 0-2 are unchanged; only row 3 (the translation row) folds in the anchor.
+    // Anchored view = T(-anchor) * RotY(gamma) * view  (row-vector convention). The anchor is the
+    // game-world point the playspace is glued to: Link's head in first person, the chase camera's
+    // position in third person. Gamma is the base yaw of that frame: 0 in first person (world-
+    // aligned, orientation pure-HMD), pi - cameraYaw in third person (facing tracking-forward
+    // looks where the stock camera looks). Pitch/roll are never folded in — the horizon stays
+    // level with real gravity. Anchor is in game units, matching the world_scale-scaled HMD
+    // translation.
+    // The game pushes anchor + gamma at 20 fps; interpolate both to this render sub-frame with the
+    // same alpha the engine uses for everything else, so the camera tracks the smooth world.
+    const glm::vec3 a = glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha);
+    const float g = xr.anchor_gamma_prev + (xr.anchor_gamma - xr.anchor_gamma_prev) * xr.interp_alpha;
+    const float cg = cosf(g), sg = sinf(g);
+
+    // C = RowRotY(g) * v: rotate the (translated) world into the yawed playspace frame before the
+    // raw HMD view. RowRotY rows: [c 0 -s; 0 1 0; s 0 c] — rotates a direction's yaw additively.
+    float C[4][4];
+    for (int c = 0; c < 4; c++) {
+        C[0][c] = cg * v[0][c] - sg * v[2][c];
+        C[1][c] = v[1][c];
+        C[2][c] = sg * v[0][c] + cg * v[2][c];
+        C[3][c] = v[3][c];
+    }
     for (int r = 0; r < 3; r++) {
         for (int c = 0; c < 4; c++) {
-            out[r][c] = v[r][c];
+            out[r][c] = C[r][c];
         }
     }
-    // The game pushes the anchor at 20 fps; interpolate it to this render sub-frame with the same
-    // alpha the engine uses for everything else, so the camera tracks the smoothly-rendered world.
-    const glm::vec3 a = glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha);
     const float ax = a.x, ay = a.y, az = a.z;
     for (int c = 0; c < 4; c++) {
-        out[3][c] = v[3][c] - ax * v[0][c] - ay * v[1][c] - az * v[2][c];
+        out[3][c] = C[3][c] - ax * C[0][c] - ay * C[1][c] - az * C[2][c];
     }
 }
 
@@ -1362,13 +1576,25 @@ void vr_get_camera_pose(float eye[3], float fwd[3], float up[3]) {
     q *= (1.0f / qlen);
     glm::mat3 R = glm::mat3_cast(q);
 
-    // eye = Link's head anchor + the HMD's positional offset (the world point the render maps to the
-    // view origin). Use the latest pushed anchor; for a per-game-frame culling query, sub-frame
-    // interpolation isn't needed.
-    glm::vec3 anchor = (xr.first_person && xr.anchor_initialized) ? xr.anchor : glm::vec3(0.0f);
-    glm::vec3 e = anchor + pos;
+    // eye = anchor (Link's head in first person, chase camera in third) + the HMD's positional
+    // offset (the world point the render maps to the view origin). Use the latest pushed anchor;
+    // for a per-game-frame culling query, sub-frame interpolation isn't needed.
+    glm::vec3 anchor = xr.anchor_initialized ? xr.anchor : glm::vec3(0.0f);
     glm::vec3 f = R * glm::vec3(0.0f, 0.0f, -1.0f);
     glm::vec3 u = R * glm::vec3(0.0f, 1.0f, 0.0f);
+
+    // Rotate the HMD-frame vectors from the yawed playspace frame into the world (inverse of the
+    // view matrix's RowRotY(gamma)): additive yaw by -gamma.
+    if (xr.anchor_gamma != 0.0f) {
+        const float cg = cosf(xr.anchor_gamma), sg = sinf(xr.anchor_gamma);
+        auto unyaw = [cg, sg](glm::vec3 v) {
+            return glm::vec3(v.x * cg - v.z * sg, v.y, v.x * sg + v.z * cg);
+        };
+        pos = unyaw(pos);
+        f = unyaw(f);
+        u = unyaw(u);
+    }
+    glm::vec3 e = anchor + pos;
 
     eye[0] = e.x; eye[1] = e.y; eye[2] = e.z;
     fwd[0] = f.x; fwd[1] = f.y; fwd[2] = f.z;
@@ -1461,7 +1687,52 @@ void vr_clamp_roomscale_lean(float max_units) {
 // --------------------------------------------------------------------------
 
 bool vr_is_initialized() {
-    return xr.initialized;
+    // The mod-wide predicate: every VR hook in the game and interpreter gates on this, so the
+    // enabled flag toggles the entire mod as one unit.
+    return xr.initialized && xr.enabled;
+}
+
+// Latch a pending VR<->flat mode request (CVar gVrEnabled). MUST be called at a game-tick boundary
+// only (graph.c, before the tick's display list is built): a DL built for one mode must never be
+// interpreted in the other, and toggling between xrBeginFrame/xrEndFrame would corrupt the session.
+void vr_apply_mode_request() {
+    const bool want = CVarGetInteger("gVrEnabled", 1) != 0;
+
+    if (want && !xr.initialized) {
+        // Lazy init: launching with VR off never touches OpenXR (no SteamVR popup); the session is
+        // created the first time the player toggles in.
+        if (vr_init()) {
+            xr.reenable_fixup = true;
+        } else {
+            // No runtime/headset available — flip the CVar back so the UI reflects reality.
+            CVarSetInteger("gVrEnabled", 0);
+        }
+        return;
+    }
+
+    if (!xr.initialized) {
+        return;
+    }
+
+    // Headset presence folds into the desired mode: doffing the headset auto-drops to flat play,
+    // donning it again auto-resumes — unless the player opted to stay in VR (gVrStayOnDoff), the
+    // runtime can't report presence, or VR is manually off anyway. Because this recomputes every
+    // tick from (CVar, presence), manual F9 stays sticky while presence flips are symmetric.
+    const bool stay_on_doff = CVarGetInteger("gVrStayOnDoff", 0) != 0;
+    const bool effective = want && (xr.user_present || stay_on_doff || !xr.user_presence_supported);
+
+    if (effective && !xr.enabled) {
+        xr.enabled = true;
+        xr.reenable_fixup = true;
+    } else if (!effective && xr.enabled) {
+        xr.enabled = false;
+        // The overlay DL pointer goes stale immediately (graph.c stops re-arming it in flat mode).
+        xr.hud_commands = nullptr;
+    } else if (!xr.enabled) {
+        // Session alive but idle: keep pumping the event loop at tick rate so the runtime sees us
+        // as responsive AND so the "headset donned" presence event can arrive to resume VR.
+        poll_events();
+    }
 }
 
 int vr_get_current_eye() {
@@ -1495,6 +1766,34 @@ void vr_set_world_scale(float units_per_meter) {
 
 void vr_set_first_person(bool enabled) {
     xr.first_person = enabled;
+    if (enabled) {
+        // First person is world-aligned: no base yaw.
+        xr.anchor_gamma = xr.anchor_gamma_prev = 0.0f;
+    }
+}
+
+// Third person: base yaw of the playspace = the game camera's facing (binang, game convention:
+// yaw 0 faces +Z, dir = (sin, 0, cos)). Facing straight ahead in the headset then looks where the
+// stock camera looks — including cutscene shots. Pushed once per game tick after the anchor.
+void vr_set_camera_yaw(int16_t yaw_binang) {
+    const float kPi = 3.14159265358979323846f;
+    const float cam_yaw = (float)yaw_binang * (kPi / 32768.0f);
+    // World-to-tracking rotation: tracking-forward (world dir(pi) when gamma=0) must map to the
+    // camera's dir(cam_yaw), so rotate by gamma = pi - cam_yaw.
+    float next = kPi - cam_yaw;
+    xr.anchor_gamma_prev = xr.anchor_gamma;
+    xr.anchor_gamma = next;
+    // Interpolate across ticks via the shortest arc; snap on camera cuts (> 90 deg in one tick,
+    // e.g. cutscene shot changes) so the view doesn't smear through the swing.
+    float delta = next - xr.anchor_gamma_prev;
+    while (delta > kPi) delta -= 2.0f * kPi;
+    while (delta < -kPi) delta += 2.0f * kPi;
+    if (delta > 0.5f * kPi || delta < -0.5f * kPi) {
+        xr.anchor_gamma_prev = next;
+    } else {
+        // Keep prev within one wrap of next so the view-matrix lerp stays shortest-arc.
+        xr.anchor_gamma_prev = next - delta;
+    }
 }
 
 bool vr_is_first_person() {
@@ -1685,6 +1984,10 @@ void vr_clear_hand_matrices() {
 }
 
 bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]) {
+    // Hot path: gfx_sp_matrix calls this for EVERY G_MTX command, per eye — thousands per frame,
+    // against a registry that holds at most two entries. Skip the hash entirely when it's empty
+    // (which is every command outside Link's two hand limbs, and every frame with hands disabled).
+    if (g_hand_mtx_registry.empty()) return false;
     auto it = g_hand_mtx_registry.find(mtx);
     if (it == g_hand_mtx_registry.end()) return false;
     return vr_get_hand_matrix(it->second, out);
@@ -1771,6 +2074,7 @@ void* vr_get_hud_commands() { return xr.hud_commands; }
 void vr_begin_hud() {
     if (!xr.initialized) return;
     xr.rendering_hud = true;
+    xr.hud_ever_rendered = true;
 
     auto& sc = xr.hud_swapchain;
     XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -1807,6 +2111,8 @@ void vr_end_hud() {
 
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(xr.hud_swapchain.handle, &release_info), "xrReleaseSwapchainImage (HUD)");
+
+    vr_restore_eye_dimensions();
 }
 
 bool vr_is_rendering_hud() { return xr.rendering_hud; }
@@ -1820,7 +2126,7 @@ void vr_set_flat_screen(bool enabled) {
 }
 
 bool vr_get_flat_screen() {
-    return xr.initialized && xr.flat_screen;
+    return xr.initialized && xr.enabled && xr.flat_screen;
 }
 
 // Render the game's full frame into the screen swapchain. Reuses the HUD's "2D rendering" flag so
@@ -1829,6 +2135,7 @@ void vr_begin_screen() {
     if (!xr.initialized) return;
     xr.rendering_hud = true; // gfx_pc's "2D target" flag: use the flat projection, not the VR eyes
     xr.rendering_screen = true;
+    xr.screen_ever_rendered = true;
 
     auto& sc = xr.screen_swapchain;
     XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -1866,6 +2173,8 @@ void vr_end_screen() {
 
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(xr.screen_swapchain.handle, &release_info), "xrReleaseSwapchainImage (screen)");
+
+    vr_restore_eye_dimensions();
 }
 
 // Dimensions of whichever 2D target is currently being rendered (HUD quad or the flat-screen
@@ -1908,9 +2217,21 @@ void* vr_get_mirror_texture_id() {
 // Stubs for non-D3D11 builds
 Fast::Interpreter* vr_get_interpreter() { return nullptr; }
 bool vr_init() { return false; }
+void vr_apply_mode_request() {}
 void vr_shutdown() {}
 bool vr_begin_frame() { return false; }
 void vr_end_frame() {}
+void vr_set_frame_plan(bool, bool, bool) {}
+bool vr_should_render_eyes() { return true; }
+bool vr_should_render_hud() { return true; }
+bool vr_should_present_desktop() { return true; }
+void vr_report_frame_times(float, float, float, float, bool) {}
+void vr_report_game_tick_ms(float) {}
+void vr_get_frame_stats(struct VrFrameStats* out) {
+    if (out != nullptr) {
+        *out = {};
+    }
+}
 void vr_begin_eye(int) {}
 void vr_end_eye(int) {}
 void vr_get_projection_matrix(int, float out[4][4]) { memset(out, 0, sizeof(float) * 16); }
@@ -1924,6 +2245,7 @@ void vr_set_world_scale(float) {}
 void vr_set_first_person(bool) {}
 bool vr_is_first_person() { return false; }
 void vr_set_camera_anchor(float, float, float) {}
+void vr_set_camera_yaw(int16_t) {}
 void vr_get_camera_pose(float eye[3], float fwd[3], float up[3]) {
     eye[0] = eye[1] = eye[2] = 0.0f;
     fwd[0] = 0.0f; fwd[1] = 0.0f; fwd[2] = -1.0f;

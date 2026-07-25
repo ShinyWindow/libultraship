@@ -5312,11 +5312,25 @@ void Interpreter::AdjustPixelDepthCoordinates(float& x, float& y) {
 }
 
 void Interpreter::GetPixelDepthPrepare(float x, float y) {
+    // SOH [VR] See GetPixelDepth — the readback is skipped entirely in VR, so don't accumulate
+    // coordinates for it either.
+    if (vr_is_initialized()) {
+        return;
+    }
     AdjustPixelDepthCoordinates(x, y);
     mGetPixelDepthPending.emplace(x, y);
 }
 
 uint16_t Interpreter::GetPixelDepth(float x, float y) {
+    // SOH [VR] This is a synchronous GPU readback (compute dispatch + staging-buffer Map), i.e. a
+    // full pipeline stall, and in VR it reads mGameFb — which nothing ever renders into, because
+    // Run() binds the XR swapchain target instead. The result was already meaningless; skip the
+    // stall and report the far plane, which reads as "no geometry in front of this point" so
+    // occlusion-tested glows stay visible rather than being silently culled by a stale buffer.
+    if (vr_is_initialized()) {
+        return 0xFFFF;
+    }
+
     AdjustPixelDepthCoordinates(x, y);
 
     if (auto it = mGetPixelDepthCached.find(std::make_pair(x, y)); it != mGetPixelDepthCached.end()) {

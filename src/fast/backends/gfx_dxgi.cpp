@@ -34,6 +34,7 @@
 #include "fast/backends/gfx_screen_config.h"
 #include "fast/interpreter.h"
 #include "fast/Fast3dGui.h"
+#include "fast/vr_openxr.h"
 
 #define DECLARE_GFX_DXGI_FUNCTIONS
 #include "fast/backends/gfx_dxgi.h"
@@ -920,37 +921,47 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     // interval the user wants instead (V-Sync toggle).
     mVsyncEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_VSYNC_ENABLED, 1) ? 1 : 0;
 
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    int64_t next = qpc_to_100ns(mPreviousPresentTime.QuadPart) +
-                   FRAME_INTERVAL_NS_NUMERATOR / (FRAME_INTERVAL_NS_DENOMINATOR * 100);
-    int64_t left = next - qpc_to_100ns(t.QuadPart) - 15000UL;
-    if (left > 0) {
-        LARGE_INTEGER li;
-        li.QuadPart = -left;
-        SetWaitableTimer(mTimer, &li, 0, nullptr, nullptr, false);
-        WaitForSingleObject(mTimer, INFINITE);
-    }
+    // SOH [VR] In VR the OpenXR compositor owns frame pacing via xrWaitFrame. Both throttles below
+    // — the software frame-interval spin and a vsynced Present — would pace off the DESKTOP
+    // monitor's clock instead. Two unsynchronised pacers means every frame waits for whichever is
+    // later, so the mean period exceeds the headset's and XR frames get dropped; if the desktop
+    // runs slower than the headset it becomes a hard cap. Present the companion view unthrottled.
+    const bool xrPaced = vr_is_initialized();
+    const UINT syncInterval = xrPaced ? 0 : mVsyncEnabled;
 
-    QueryPerformanceCounter(&t);
-    t.QuadPart = qpc_to_100ns(t.QuadPart);
-    while (t.QuadPart < next) {
-        YieldProcessor();
+    LARGE_INTEGER t;
+    if (!xrPaced) {
+        QueryPerformanceCounter(&t);
+        int64_t next = qpc_to_100ns(mPreviousPresentTime.QuadPart) +
+                       FRAME_INTERVAL_NS_NUMERATOR / (FRAME_INTERVAL_NS_DENOMINATOR * 100);
+        int64_t left = next - qpc_to_100ns(t.QuadPart) - 15000UL;
+        if (left > 0) {
+            LARGE_INTEGER li;
+            li.QuadPart = -left;
+            SetWaitableTimer(mTimer, &li, 0, nullptr, nullptr, false);
+            WaitForSingleObject(mTimer, INFINITE);
+        }
+
         QueryPerformanceCounter(&t);
         t.QuadPart = qpc_to_100ns(t.QuadPart);
+        while (t.QuadPart < next) {
+            YieldProcessor();
+            QueryPerformanceCounter(&t);
+            t.QuadPart = qpc_to_100ns(t.QuadPart);
+        }
     }
     QueryPerformanceCounter(&t);
     mPreviousPresentTime = t;
-    if (mTearingSupport && !mVsyncEnabled) {
+    if (mTearingSupport && syncInterval == 0) {
         // 512: DXGI_PRESENT_ALLOW_TEARING - allows for true V-Sync off with flip model
-        ThrowIfFailed(swap_chain->Present(mVsyncEnabled, DXGI_PRESENT_ALLOW_TEARING));
+        ThrowIfFailed(swap_chain->Present(syncInterval, DXGI_PRESENT_ALLOW_TEARING));
     } else {
-        ThrowIfFailed(swap_chain->Present(mVsyncEnabled, 0));
+        ThrowIfFailed(swap_chain->Present(syncInterval, 0));
     }
 
     UINT this_present_id;
     if (swap_chain->GetLastPresentCount(&this_present_id) == S_OK) {
-        mPendingFrameStats.insert(std::make_pair(this_present_id, mVsyncEnabled));
+        mPendingFrameStats.insert(std::make_pair(this_present_id, syncInterval));
     }
     mDroppedFrame = false;
 }
@@ -980,7 +991,11 @@ void GfxWindowBackendDXGI::SwapBuffersEnd() {
         ApplyMaxFrameLatency(false);
     }
 
-    if (!mDroppedFrame) {
+    // SOH [VR] The frame-latency waitable object retires at the desktop swapchain's presentation
+    // cadence. Blocking on it in VR is the third desktop-side throttle on a loop that xrWaitFrame
+    // already paces (see SwapBuffersBegin), and it stalls the game thread right when it should be
+    // starting the next eye pass.
+    if (!mDroppedFrame && !vr_is_initialized()) {
         if (mWaitableObject != nullptr) {
             WaitForSingleObject(mWaitableObject, INFINITE);
         }

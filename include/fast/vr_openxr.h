@@ -14,10 +14,41 @@ Fast::Interpreter* vr_get_interpreter();
 // Lifecycle
 bool vr_init();
 void vr_shutdown();
+// Latch a pending VR<->flat mode request (CVar gVrEnabled). Call ONLY at a game-tick boundary,
+// before the tick's display list is built. Lazily creates the OpenXR session on first enable.
+void vr_apply_mode_request();
 
 // Per-frame
 bool vr_begin_frame();
 void vr_end_frame();
+
+// Frame plan. The window layer decides once per XR frame — BEFORE vr_begin_frame, which latches
+// the submit poses from it — which of the expensive per-frame jobs actually run. A skipped eye or
+// HUD pass keeps its previous swapchain image and is resubmitted against the pose/FOV it was
+// rendered with, so the compositor reprojects it onto the live head pose; head tracking stays at
+// full headset rate while the world content updates at the reduced rate. This is the same
+// mechanism flat-screen mode uses to keep the frozen world head-tracked behind the menu panel.
+void vr_set_frame_plan(bool render_eyes, bool render_hud, bool present_desktop);
+bool vr_should_render_eyes();
+bool vr_should_render_hud();
+bool vr_should_present_desktop();
+
+// Per-frame timing, in milliseconds, exponentially smoothed. Fed by the window layer (which is the
+// only place that sees the whole frame) and by vr_begin_frame for the xrWaitFrame block. Displayed
+// by the VR Settings performance section; purely diagnostic.
+struct VrFrameStats {
+    float wait_ms;    // blocked inside xrWaitFrame — this is spare headroom, higher is better
+    float eyes_ms;    // both eye display-list passes
+    float hud_ms;     // HUD quad pass
+    float desktop_ms; // companion window: ImGui + mirror blit + Present
+    float frame_ms;   // whole DrawAndRunGraphicsCommands
+    float tick_ms;    // GameState_Update, per 20 Hz game tick
+    float eye_hz;     // eye passes actually rendered per second
+    float frame_hz;   // XR frames submitted per second
+};
+void vr_report_frame_times(float eyes_ms, float hud_ms, float desktop_ms, float frame_ms, bool rendered_eyes);
+void vr_report_game_tick_ms(float tick_ms);
+void vr_get_frame_stats(struct VrFrameStats* out);
 
 // Per-eye
 void vr_begin_eye(int eye);
@@ -41,6 +72,10 @@ void vr_set_world_scale(float units_per_meter);
 void vr_set_first_person(bool enabled);
 bool vr_is_first_person();
 void vr_set_camera_anchor(float x, float y, float z);
+// Third person: base yaw of the playspace frame = the game camera's facing (binang). Facing
+// tracking-forward in the headset then looks where the stock camera looks. Reset by
+// vr_set_first_person(true).
+void vr_set_camera_yaw(int16_t yaw_binang);
 int16_t vr_get_head_yaw();
 
 // Camera unification (Phase 3): report the rendered HMD pose to the game so its CPU-side camera

@@ -220,7 +220,6 @@ void GfxRenderingAPIDX11::Init() {
         mContext->Flush();
 
         mLastShaderProgram = nullptr;
-        mLastVertexBufferStride = 0;
         mLastBlendState.Reset();
         for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
             mLastResourceViews[i].Reset();
@@ -260,7 +259,13 @@ void GfxRenderingAPIDX11::Init() {
     ZeroMemory(&vertex_buffer_desc, sizeof(D3D11_BUFFER_DESC));
 
     vertex_buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-    vertex_buffer_desc.ByteWidth = 256 * 32 * 3 * sizeof(float); // Same as buf_vbo size in gfx_pc
+    // Sized for a ring of RING_BATCHES max-size batches (one batch = buf_vbo in gfx_pc). Draws
+    // append with MAP_WRITE_NO_OVERWRITE and only force a rename when the cursor wraps, so a deeper
+    // ring means proportionally fewer renames. Stereo submits ~3x the draws of a flat frame.
+    constexpr uint32_t RING_BATCHES = 32;
+    mVertexBufferCapacity = RING_BATCHES * 256u * 32u * 3u * (uint32_t)sizeof(float);
+    mVertexBufferOffset = 0;
+    vertex_buffer_desc.ByteWidth = mVertexBufferCapacity;
     vertex_buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     vertex_buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     vertex_buffer_desc.MiscFlags = 0;
@@ -779,21 +784,36 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mPrimDepthDirty = false;
     }
 
-    // Set vertex buffer data
+    // Set vertex buffer data.
+    //
+    // Ring allocation: append this batch at the current cursor with MAP_WRITE_NO_OVERWRITE, which
+    // promises the driver we are not touching bytes it may still be reading, so it costs nothing.
+    // Only a wrap needs MAP_WRITE_DISCARD, which renames the buffer and makes the whole range
+    // free to write again. Renaming on every draw (the previous behaviour) is the single largest
+    // per-draw API cost, and stereo triples the number of draws per displayed frame.
+    const uint32_t stride = mShaderProgram->numFloats * sizeof(float);
+    const uint32_t bytes = (uint32_t)(buf_vbo_len * sizeof(float));
+
+    // Keep the cursor 16-byte aligned; vertex i is fetched from offset + i * stride, so the base
+    // only needs natural alignment for the element format.
+    uint32_t offset = (mVertexBufferOffset + 15u) & ~15u;
+    D3D11_MAP mapType = D3D11_MAP_WRITE_NO_OVERWRITE;
+    if (offset + bytes > mVertexBufferCapacity) {
+        offset = 0;
+        mapType = D3D11_MAP_WRITE_DISCARD;
+    }
 
     D3D11_MAPPED_SUBRESOURCE ms;
     ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
-    mContext->Map(mVertexBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
-    memcpy(ms.pData, buf_vbo, buf_vbo_len * sizeof(float));
+    mContext->Map(mVertexBuffer.Get(), 0, mapType, 0, &ms);
+    memcpy(static_cast<uint8_t*>(ms.pData) + offset, buf_vbo, bytes);
     mContext->Unmap(mVertexBuffer.Get(), 0);
 
-    uint32_t stride = mShaderProgram->numFloats * sizeof(float);
-    uint32_t offset = 0;
+    mVertexBufferOffset = offset + bytes;
 
-    if (mLastVertexBufferStride != stride) {
-        mLastVertexBufferStride = stride;
-        mContext->IASetVertexBuffers(0, 1, mVertexBuffer.GetAddressOf(), &stride, &offset);
-    }
+    // The binding changes every draw now (the offset moves), so unlike before there is nothing to
+    // skip on an unchanged stride — which also means a ClearState between draws can't desync it.
+    mContext->IASetVertexBuffers(0, 1, mVertexBuffer.GetAddressOf(), &stride, &offset);
 
     if (mLastShaderProgram != mShaderProgram) {
         mLastShaderProgram = mShaderProgram;

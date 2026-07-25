@@ -1,7 +1,26 @@
 ﻿#include "vr_interface.h"
 #include "fast/vr_openxr.h"
 
+#include <chrono>
+
+namespace {
+std::chrono::steady_clock::time_point g_game_tick_start;
+} // namespace
+
 extern "C" {
+
+void VR_GameTickBegin(void) {
+    if (vr_is_initialized()) {
+        g_game_tick_start = std::chrono::steady_clock::now();
+    }
+}
+
+void VR_GameTickEnd(void) {
+    if (vr_is_initialized()) {
+        vr_report_game_tick_ms(
+            std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - g_game_tick_start).count());
+    }
+}
 
 void VR_SetFlatScreen(bool enabled) {
     vr_set_flat_screen(enabled);
@@ -15,8 +34,16 @@ bool VR_IsInitialized() {
     return vr_is_initialized();
 }
 
+void VR_ApplyModeRequest(void) {
+    vr_apply_mode_request();
+}
+
 void VR_SetOverlayDisplayList(void* commands) {
     vr_set_hud_commands(commands);
+}
+
+void VR_SetCameraYaw(int16_t yaw_binang) {
+    vr_set_camera_yaw(yaw_binang);
 }
 
 void VR_SetFirstPerson(bool enabled) {
