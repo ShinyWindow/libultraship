@@ -28,6 +28,7 @@
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
+#include "fast/vr_openxr.h"
 
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
@@ -1458,7 +1459,12 @@ void Interpreter::CalculateNormalDir(const F3DLight_t* light, float coeffs[3]) {
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
-    if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
+    // SOH [VR] Live hand matrices: the game tags each hand limb's Mtx*; substitute the CURRENT
+    // controller pose here so hands track at headset rate, not the interpolated 20fps game rate.
+    // Checked before mCurMtxReplacements — the interpolation system also has an entry for this Mtx.
+    if (vr_is_initialized() && vr_lookup_hand_matrix((const void*)addr, matrix)) {
+        // matrix filled by the VR layer
+    } else if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
                 float v = it->second.mf[i][j];
@@ -1488,7 +1494,18 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     const int8_t mtx_push = get_attr(MTX_PUSH);
 
     if (parameters & mtx_projection) {
-        if (parameters & mtx_load) {
+        // SOH [VR] Stereo rendering: replace the game's perspective projection with the current
+        // eye's VR view * projection. 2D targets (HUD quad, flat-screen panel) keep the game's own
+        // flat projection.
+        if (vr_is_initialized() && !vr_is_rendering_hud()) {
+            if (parameters & mtx_load) {
+                float vr_proj[4][4], vr_view[4][4];
+                vr_get_projection_matrix(vr_get_current_eye(), vr_proj);
+                vr_get_view_matrix(vr_get_current_eye(), vr_view);
+                MatrixMul(mRsp->P_matrix, vr_view, vr_proj);
+            }
+            // MUL onto an eye projection would double-apply game transforms; ignore it in VR.
+        } else if (parameters & mtx_load) {
             memcpy(mRsp->P_matrix, matrix, sizeof(matrix));
         } else {
             MatrixMul(mRsp->P_matrix, matrix, mRsp->P_matrix);
@@ -1528,6 +1545,11 @@ void Interpreter::GfxSpPopMatrix(uint32_t count) {
 float Interpreter::AdjXForAspectRatio(float x) const {
     // Skip widescreen adjustment for fixed-size off-screen FBs (HUD elements,
     // small capture buffers), or those which specify a fixed aspect ratio.
+    // SOH [VR] Also skip in stereo passes: the eye projection defines the FOV/aspect, and 2D
+    // content must not be stretched to the eye texture's aspect.
+    if (vr_is_initialized() && !vr_is_rendering_hud()) {
+        return x;
+    }
     if (mFbActive && mActiveFrameBuffer != mFrameBuffers.end() &&
         (!mActiveFrameBuffer->second.resize || mActiveFrameBuffer->second.forceFixedAspect)) {
         return x;
@@ -5102,11 +5124,21 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 
     mCurMtxReplacements = &mtx_replacements;
 
+    // SOH [VR] Every VR pass (eye, HUD quad, flat-screen panel) renders into an OpenXR swapchain
+    // image that vr_begin_* has already acquired, bound, and cleared — binding the window
+    // backbuffer or game FB here would clobber that. Re-assert the XR target instead.
+    const bool vrPass = vr_is_initialized();
+
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
-    mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
-    mRapi->ClearFramebuffer(true, true);
+    if (vrPass) {
+        vr_rebind_current_eye_target();
+    } else {
+        mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0,
+                                      (float)mCurDimensions.height / mNativeDimensions.height);
+        mRapi->ClearFramebuffer(true, true);
+    }
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
@@ -5123,7 +5155,11 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
                 // soft locking the renderer
                 if (mFbActive) {
                     mFbActive = 0;
-                    mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, 1);
+                    if (vrPass) {
+                        vr_rebind_current_eye_target();
+                    } else {
+                        mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, 1);
+                    }
                 }
 
                 break;
@@ -5137,7 +5173,15 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 
-    if (mRendersToFb) {
+    if (vrPass) {
+        // SOH [VR] The XR swapchain image is presented by the compositor (released in vr_end_*);
+        // there is nothing to resolve into the window backbuffer between passes. The desktop
+        // companion view is composited by the GUI from the VR mirror texture instead of mGameFb.
+        if (mFbActive) {
+            mFbActive = 0;
+            vr_rebind_current_eye_target();
+        }
+    } else if (mRendersToFb) {
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
         if (mMsaaLevel > 1) {
@@ -5246,6 +5290,13 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
 }
 
 void Interpreter::ResetFrameBuffer() {
+    // SOH [VR] Mid-pass framebuffer restores must return to the XR target being rendered (eye,
+    // HUD, or flat-screen panel), not the window backbuffer — the pause menu's prerender copies
+    // run through here, and rebinding target 0 would dump the rest of the pass into the window.
+    if (vr_is_initialized()) {
+        vr_rebind_current_eye_target();
+        return;
+    }
     mRapi->StartDrawToFramebuffer(0, (float)mCurDimensions.height / mNativeDimensions.height);
 }
 

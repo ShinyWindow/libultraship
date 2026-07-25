@@ -125,6 +125,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     GfxWindowBackendDXGI* mWindowBackend = nullptr;
     D3D_FEATURE_LEVEL mFeatureLevel;
 
+    // SOH [VR] The VR layer binds OpenXR swapchain RTVs directly (outside the framebuffer map), so
+    // it must be able to tell the backend the bound target's height for the viewport/scissor Y-flip.
+    void SetRenderTargetHeight(int32_t height) {
+        mRenderTargetHeight = height;
+    }
+
   private:
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);

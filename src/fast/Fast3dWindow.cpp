@@ -14,6 +14,7 @@
 #include "fast/backends/gfx_window_manager_api.h"
 
 #include "fast/Fast3dGui.h"
+#include "fast/vr_openxr.h"
 
 #include <fstream>
 
@@ -52,6 +53,7 @@ Fast3dWindow::Fast3dWindow() : Fast3dWindow(std::vector<std::shared_ptr<Ship::Gu
 
 Fast3dWindow::~Fast3dWindow() {
     SPDLOG_DEBUG("destruct fast3dwindow");
+    vr_shutdown();
     mInterpreter->Destroy();
     delete mRenderingApi;
     delete mWindowManagerApi;
@@ -111,6 +113,9 @@ void Fast3dWindow::Init() {
 
     SetTextureFilter((FilteringMode)Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
         CVAR_TEXTURE_FILTER, FILTER_THREE_POINT));
+
+    // SOH [VR] Must run after Interpreter::Init — the OpenXR session binds the D3D11 device.
+    vr_init();
 }
 
 int32_t Fast3dWindow::GetTargetFps() {
@@ -208,8 +213,47 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     gui->StartDraw();
     // Setup game framebuffers to match available window space
     mInterpreter->StartFrame();
-    // Execute the games gfx commands
-    mInterpreter->Run(commands, mtxReplacements);
+
+    // SOH [VR] Stereo path: run the interpreter once per eye into the OpenXR swapchains (or once
+    // onto the flat-screen panel for 2D contexts), render the HUD quad, submit the XR frame, then
+    // let the GUI composite the desktop companion view from the VR mirror texture.
+    if (vr_is_initialized()) {
+        // The port sets mInterpolationT per sub-frame (see soh RunCommands); mirror it into the VR
+        // layer so the camera anchor interpolates in lockstep with the interpolated world.
+        vr_set_interp_alpha(mInterpreter->mInterpolationT);
+        if (vr_begin_frame()) {
+            if (vr_get_flat_screen()) {
+                // 2D context (file select, pause): whole frame onto the world-locked panel; the
+                // eye swapchains keep their last world frame, resubmitted with its original pose.
+                vr_begin_screen();
+                mInterpreter->Run(commands, mtxReplacements);
+                vr_end_screen();
+            } else {
+                for (int eye = 0; eye < 2; eye++) {
+                    vr_begin_eye(eye);
+                    mInterpreter->Run(commands, mtxReplacements);
+                    vr_end_eye(eye);
+                }
+            }
+
+            // Head-locked HUD overlay (rendered once, not per-eye)
+            Gfx* hudCommands = static_cast<Gfx*>(vr_get_hud_commands());
+            if (hudCommands != nullptr) {
+                vr_begin_hud();
+                mInterpreter->Run(hudCommands, mtxReplacements);
+                vr_end_hud();
+            }
+
+            vr_end_frame();
+        }
+
+        // Desktop companion window: the GUI's game-image composite reads mGfxFrameBuffer; point it
+        // at the VR mirror (left eye copy) since the game never rendered into mGameFb.
+        mInterpreter->mGfxFrameBuffer = (uintptr_t)vr_get_mirror_texture_id();
+    } else {
+        // Execute the games gfx commands
+        mInterpreter->Run(commands, mtxReplacements);
+    }
     // Renders the game frame buffer to the final window and finishes the GUI
     gui->EndDraw();
     // Finalize swap buffers
