@@ -32,6 +32,13 @@ bool VR_IsFlatScreen(void);
 void VR_SetFirstPerson(bool enabled);
 bool VR_GetFirstPerson(void);
 void VR_SetCameraAnchor(float x, float y, float z);
+// Link's standing eye height in game units, pushed each first-person frame. With auto world scale
+// on, the VR layer derives units/meter from this and the player's real measured eye height, so the
+// game ground matches the physical floor and child/adult swaps rescale automatically.
+void VR_SetLinkEyeHeight(float units);
+// Alyx-style comfort fade: 0 = clear, 1 = world layer black (menus/HUD unaffected). The game sets
+// this each tick from how far the player's physical head sits beyond solid geometry.
+void VR_SetViewFade(float fade);
 // Third person: the game camera's facing (binang yaw) becomes the playspace's base orientation,
 // so looking straight ahead in the headset looks where the stock camera looks (cutscenes too).
 void VR_SetCameraYaw(int16_t yaw_binang);
@@ -83,6 +90,9 @@ void VR_ClampRoomscaleLean(float max_units);
 // Controller grip pose in game-world coords (eye/anchor frame): pos in game units, quat is x,y,z,w.
 // Returns false (and identity) if that hand isn't tracked. Buttons/sticks/trigger/grip per hand.
 bool     VR_GetHandPose(int hand, float pos[3], float quat[4]);
+// Controller aim ray (runtime-calibrated pointing pose) in game-world coords: origin + unit
+// forward direction. This is the ray for weapon aiming (slingshot/bow/hookshot).
+bool     VR_GetAimRay(int hand, float pos[3], float dir[3]);
 bool     VR_IsHandActive(int hand);
 uint16_t VR_GetControllerButton(int hand);
 void     VR_GetThumbstick(int hand, float* x, float* y);

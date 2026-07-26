@@ -4129,8 +4129,11 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
     gfx->Flush();
     gfx->mFbActive = false;
     gfx->mActiveFrameBuffer = gfx->mFrameBuffers.end();
-    gfx->mRapi->StartDrawToFramebuffer(gfx->mRendersToFb ? gfx->mGameFb : 0,
-                                       (float)gfx->mCurDimensions.height / gfx->mNativeDimensions.height);
+    // SOH [VR] Route through ResetFrameBuffer instead of binding mGameFb/0 directly: in VR the
+    // "main target" is the currently bound XR image (eye / HUD / flat-screen panel), and binding
+    // mGameFb here sent the entire rest of the pause frame — backdrop and kaleido UI — into an
+    // off-screen buffer nobody displays (the black-inventory bug). Non-VR behavior is identical.
+    gfx->ResetFrameBuffer();
     // Force viewport and scissor to reapply against the main framebuffer, in case a previous smaller
     // framebuffer truncated the values
     gfx->mRdp->viewport_or_scissor_changed = true;
@@ -5250,6 +5253,22 @@ void Interpreter::SetFrameBuffer(int fb, float noiseScale) {
 void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* hasCopiedPtr) {
     // Do not copy again if we have already copied before
     if (copyOnce && hasCopiedPtr != nullptr && *hasCopiedPtr) {
+        return;
+    }
+
+    // SOH [VR] "Source 0" means the main game image, but in VR the world renders into OpenXR
+    // swapchains — fb 0 / mGameFb are never drawn to, so the copy would capture blackness AND the
+    // pause menu's capture loop would wait on garbage (black inventory screen). Give the capture a
+    // deterministic black, report success so the game's state machine advances and the pause UI
+    // draws, and re-assert the XR target. The frozen world remains visible around the panel via
+    // the resubmitted projection layer, so no backdrop screenshot is needed.
+    if (vr_is_initialized() && fb_src_id == 0) {
+        mRapi->StartDrawToFramebuffer(fb_dst_id, 1);
+        mRapi->ClearFramebuffer(true, false);
+        vr_rebind_current_eye_target();
+        if (hasCopiedPtr != nullptr) {
+            *hasCopiedPtr = true;
+        }
         return;
     }
 

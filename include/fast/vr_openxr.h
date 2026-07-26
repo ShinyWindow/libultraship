@@ -67,6 +67,11 @@ void vr_get_recommended_resolution(uint32_t* width, uint32_t* height);
 uint32_t vr_get_refresh_rate();
 float vr_get_world_scale();
 void vr_set_world_scale(float units_per_meter);
+// Link's standing eye height in game units, pushed each first-person frame. Auto world scale
+// derives units/meter from this and the player's measured physical eye height (STAGE floor).
+void vr_set_link_eye_height(float units);
+// Alyx-style in-wall fade target (0 clear .. 1 black); world layer only, smoothed per XR frame.
+void vr_set_view_fade(float fade);
 
 // First-person camera
 void vr_set_first_person(bool enabled);
@@ -102,6 +107,9 @@ void vr_clamp_roomscale_lean(float max_units);
 // coords (same anchor + world_scale transform as the camera); out_quat is x,y,z,w. See the
 // vr_motion_controls plan.
 bool vr_get_hand_pose(int hand, float out_pos[3], float out_quat[4]);
+// Controller aim ray (the runtime's calibrated pointing pose) in game-world coords:
+// origin + unit forward. For weapon aiming. False (and dir = -Z) if untracked.
+bool vr_get_aim_ray(int hand, float out_pos[3], float out_dir[3]);
 bool vr_is_hand_active(int hand);
 uint16_t vr_get_controller_buttons(int hand);
 void vr_get_thumbstick(int hand, float* x, float* y);
@@ -138,6 +146,7 @@ void* vr_get_hud_commands();
 void vr_begin_hud();
 void vr_end_hud();
 bool vr_is_rendering_hud();
+bool vr_is_rendering_screen();
 
 // Flat-screen mode: 2D contexts (file select, pause) render the whole frame to a world-locked
 // floating panel instead of the stereo eyes; the frozen world stays behind it, still head-tracked.

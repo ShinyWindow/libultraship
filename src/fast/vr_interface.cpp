@@ -42,6 +42,14 @@ void VR_SetOverlayDisplayList(void* commands) {
     vr_set_hud_commands(commands);
 }
 
+void VR_SetLinkEyeHeight(float units) {
+    vr_set_link_eye_height(units);
+}
+
+void VR_SetViewFade(float fade) {
+    vr_set_view_fade(fade);
+}
+
 void VR_SetCameraYaw(int16_t yaw_binang) {
     vr_set_camera_yaw(yaw_binang);
 }
@@ -96,6 +104,10 @@ void VR_ResetRoomscale(void) {
 
 void VR_ClampRoomscaleLean(float max_units) {
     vr_clamp_roomscale_lean(max_units);
+}
+
+bool VR_GetAimRay(int hand, float pos[3], float dir[3]) {
+    return vr_get_aim_ray(hand, pos, dir);
 }
 
 bool VR_GetHandPose(int hand, float pos[3], float quat[4]) {

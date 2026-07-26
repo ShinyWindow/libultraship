@@ -104,6 +104,17 @@ static struct {
     XrSystemId system_id;
     XrSession session;
     XrSpace local_space;
+    XrSpace stage_space; // floor-level origin, used only for eye-height measurement (auto scale)
+
+    // Auto world scale: scale = Link's eye height (game units, pushed by the game each frame) /
+    // the player's physical eye height (meters, measured above the stage floor at calibration).
+    // Recalibrated on first-person entry, manual recenter, and whenever Link's eye height changes
+    // materially (child <-> adult).
+    float link_eye_height_units;
+    float auto_world_scale;
+    float calibrated_link_eye_height;
+    bool scale_calibrated;
+    bool scale_recalibrate_requested;
     XrSessionState session_state;
     bool session_running;
 
@@ -240,6 +251,13 @@ static struct {
     // unavailable the feature is inert: user_present stays true and doffing changes nothing.
     bool user_presence_supported;
     bool user_present;
+
+    // Alyx-style in-wall view fade: when the player's physical head is inside geometry, the WORLD
+    // layer fades toward black at the compositor (XR_KHR_composition_layer_color_scale_bias) —
+    // the head is never pushed back. Target set by the game per tick; smoothed per XR frame.
+    bool color_scale_supported;
+    float view_fade_target;
+    float view_fade_current;
 } xr = {};
 
 static void vr_restore_eye_dimensions() {
@@ -344,6 +362,8 @@ static void handle_session_state_change(XrSessionState new_state) {
     }
 }
 
+static void vr_reset_snap_turn(); // defined with the snap-turn state below
+
 static void poll_events() {
     XrEventDataBuffer event = { XR_TYPE_EVENT_DATA_BUFFER };
     while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
@@ -356,6 +376,21 @@ static void poll_events() {
             auto* presence_event = reinterpret_cast<XrEventDataUserPresenceChangedEXT*>(&event);
             xr.user_present = (presence_event->isUserPresent == XR_TRUE);
             spdlog::info("[VR] Headset {}", xr.user_present ? "donned" : "doffed");
+        } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+            // The user triggered the runtime's built-in recenter: LOCAL space reorients so their
+            // CURRENT physical facing becomes the new neutral. Because our view frames compose
+            // "base yaw + head offset from neutral", this inherently realigns the player — in
+            // third person, neutral = the chase camera's facing, so after a recenter they are
+            // looking at Link from directly behind the camera again. We just have to drop every
+            // piece of state expressed in the OLD space coordinates.
+            auto* space_event = reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&event);
+            if (space_event->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+                spdlog::info("[VR] System recenter — realigning playspace");
+                vr_reset_snap_turn();                    // accumulated turn was in old-space coords
+                vr_reset_roomscale();                    // old-space origin would read as a huge lean
+                xr.scale_recalibrate_requested = true;   // player is standing normally right now
+                xr.flat_screen_prev = false;             // re-place the menu panel in the new space
+            }
         }
         event = { XR_TYPE_EVENT_DATA_BUFFER };
     }
@@ -577,6 +612,12 @@ static void update_input() {
 static glm::quat g_turn_rot(1.0f, 0.0f, 0.0f, 0.0f);
 static glm::vec3 g_turn_off(0.0f);
 
+// Drop the accumulated artificial turn (system recenter: it was expressed in old-space coords).
+static void vr_reset_snap_turn() {
+    g_turn_rot = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    g_turn_off = glm::vec3(0.0f);
+}
+
 static XrPosef apply_turn(const XrPosef& p) {
     const glm::vec3 pos = g_turn_rot * glm::vec3(p.position.x, p.position.y, p.position.z) + g_turn_off;
     const glm::quat q =
@@ -643,6 +684,8 @@ bool vr_init() {
     // Optional extensions are enabled only when the runtime offers them.
     xr.user_presence_supported = false;
     xr.user_present = true; // assume worn until the runtime says otherwise
+    xr.color_scale_supported = false;
+    xr.view_fade_target = xr.view_fade_current = 0.0f;
     {
         uint32_t ext_count = 0;
         xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr);
@@ -652,11 +695,20 @@ bool vr_init() {
             if (strcmp(p.extensionName, XR_EXT_USER_PRESENCE_EXTENSION_NAME) == 0) {
                 xr.user_presence_supported = true;
             }
+            if (strcmp(p.extensionName, XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME) == 0) {
+                xr.color_scale_supported = true;
+            }
         }
     }
 
-    const char* extensions[2] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME, XR_EXT_USER_PRESENCE_EXTENSION_NAME };
-    const uint32_t extension_count = xr.user_presence_supported ? 2 : 1;
+    const char* extensions[3] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
+    uint32_t extension_count = 1;
+    if (xr.user_presence_supported) {
+        extensions[extension_count++] = XR_EXT_USER_PRESENCE_EXTENSION_NAME;
+    }
+    if (xr.color_scale_supported) {
+        extensions[extension_count++] = XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME;
+    }
 
     XrInstanceCreateInfo instance_ci = { XR_TYPE_INSTANCE_CREATE_INFO };
     strcpy(instance_ci.applicationInfo.applicationName, "Ship of Harkinian VR");
@@ -712,6 +764,32 @@ bool vr_init() {
         xrDestroySession(xr.session);
         xrDestroyInstance(xr.instance);
         return false;
+    }
+
+    // --- Create STAGE space (floor-level origin) for physical eye-height measurement ---
+    // Used only to calibrate auto world scale: everything else stays in LOCAL. Optional — if the
+    // runtime doesn't offer STAGE (no floor calibration), auto scale stays unavailable and the
+    // manual gVrWorldScale value is used.
+    xr.stage_space = XR_NULL_HANDLE;
+    {
+        uint32_t space_count = 0;
+        xrEnumerateReferenceSpaces(xr.session, 0, &space_count, nullptr);
+        std::vector<XrReferenceSpaceType> space_types(space_count);
+        xrEnumerateReferenceSpaces(xr.session, space_count, &space_count, space_types.data());
+        for (XrReferenceSpaceType t : space_types) {
+            if (t == XR_REFERENCE_SPACE_TYPE_STAGE) {
+                XrReferenceSpaceCreateInfo stage_ci = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+                stage_ci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+                stage_ci.poseInReferenceSpace = { { 0, 0, 0, 1 }, { 0, 0, 0 } };
+                if (!XR_SUCCEEDED(xrCreateReferenceSpace(xr.session, &stage_ci, &xr.stage_space))) {
+                    xr.stage_space = XR_NULL_HANDLE;
+                }
+                break;
+            }
+        }
+        spdlog::info("[VR] Stage (floor) space {} — auto world scale {}",
+                     xr.stage_space != XR_NULL_HANDLE ? "available" : "unavailable",
+                     xr.stage_space != XR_NULL_HANDLE ? "enabled" : "disabled");
     }
 
     // Motion-control input (controller poses + buttons). Optional — the HMD works without it, so a
@@ -1073,6 +1151,12 @@ void vr_shutdown() {
         xrDestroySpace(xr.view_space);
         xr.view_space = XR_NULL_HANDLE;
     }
+    if (xr.stage_space != XR_NULL_HANDLE) {
+        xrDestroySpace(xr.stage_space);
+        xr.stage_space = XR_NULL_HANDLE;
+    }
+    xr.scale_calibrated = false;
+    xr.scale_recalibrate_requested = false;
     if (xr.local_space != XR_NULL_HANDLE) {
         xrDestroySpace(xr.local_space);
         xr.local_space = XR_NULL_HANDLE;
@@ -1223,6 +1307,40 @@ bool vr_begin_frame() {
     // Sync controllers + locate hand poses for this frame (motion controls).
     update_input();
 
+    // Auto world scale calibration: measure the player's physical eye height above the real floor
+    // (STAGE space) and derive the scale that puts their eyes exactly at Link's eyes — which also
+    // makes the game ground coincide with the real floor. Runs when requested (first-person entry,
+    // manual recenter) or when Link's eye height changes materially (child <-> adult swap).
+    if (CVarGetInteger("gVrAutoWorldScale", 1) && xr.stage_space != XR_NULL_HANDLE &&
+        xr.link_eye_height_units > 1.0f) {
+        const bool eye_height_changed =
+            xr.scale_calibrated &&
+            fabsf(xr.link_eye_height_units - xr.calibrated_link_eye_height) > 2.0f;
+        if (xr.scale_recalibrate_requested || !xr.scale_calibrated || eye_height_changed) {
+            XrSpaceLocation stage_loc = { XR_TYPE_SPACE_LOCATION };
+            if (XR_SUCCEEDED(xrLocateSpace(xr.local_space, xr.stage_space, xr.frame_state.predictedDisplayTime,
+                                           &stage_loc)) &&
+                (stage_loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+                const float head_local_y = 0.5f * (xr.views[0].pose.position.y + xr.views[1].pose.position.y);
+                const float eye_height_m = head_local_y + stage_loc.pose.position.y;
+                // Sanity window: reject crouched/mistracked measurements rather than producing a
+                // wild scale; the previous calibration (or the manual CVar) stays in effect.
+                if (eye_height_m > 0.9f && eye_height_m < 2.4f) {
+                    xr.auto_world_scale = xr.link_eye_height_units / eye_height_m;
+                    xr.auto_world_scale = fminf(fmaxf(xr.auto_world_scale, 10.0f), 100.0f);
+                    xr.calibrated_link_eye_height = xr.link_eye_height_units;
+                    xr.scale_calibrated = true;
+                    xr.scale_recalibrate_requested = false;
+                    spdlog::info("[VR] World scale calibrated: {:.1f} units/m (eye {:.0f} units / {:.2f} m)",
+                                 xr.auto_world_scale, xr.link_eye_height_units, eye_height_m);
+                }
+            }
+        }
+        if (xr.scale_calibrated) {
+            xr.world_scale = xr.auto_world_scale;
+        }
+    }
+
     // Re-enable fixup: the player may have physically moved while playing flat, so map their
     // CURRENT position to Link's current body — otherwise the stale roomscale origin makes Link
     // glide off to wherever the player wandered. Needs this frame's freshly located views.
@@ -1329,6 +1447,27 @@ void vr_end_frame() {
     projection_layer.viewCount = 2;
     projection_layer.views = projection_views;
 
+    // Alyx-style in-wall fade: darken the WORLD layer at the compositor while the player's head is
+    // inside geometry (the head is never pushed back — golden rule of VR cameras). Smoothed here
+    // at XR frame rate so the 20 Hz game-side target reads as a clean ~100 ms fade. Menus/HUD
+    // layers stay at full brightness.
+    XrCompositionLayerColorScaleBiasKHR color_scale = { XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR };
+    {
+        const float step = 0.12f;
+        if (xr.view_fade_current < xr.view_fade_target) {
+            xr.view_fade_current = fminf(xr.view_fade_current + step, xr.view_fade_target);
+        } else {
+            xr.view_fade_current = fmaxf(xr.view_fade_current - step, xr.view_fade_target);
+        }
+        if (xr.color_scale_supported && xr.view_fade_current > 0.001f) {
+            const float s = 1.0f - xr.view_fade_current;
+            color_scale.colorScale = { s, s, s, 1.0f };
+            color_scale.colorBias = { 0.0f, 0.0f, 0.0f, 0.0f };
+            color_scale.next = nullptr;
+            projection_layer.next = &color_scale;
+        }
+    }
+
     // HUD quad layer (alpha-blended). Attachment via gVrHudAttach: 0 = head-locked (classic),
     // 1/2 = pinned to the left/right controller like a wrist panel. Hand modes use the RAW grip
     // pose in local_space (compositor quads must not carry the artificial snap-turn) and fall back
@@ -1407,8 +1546,10 @@ void vr_end_frame() {
         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&screen_layer);
     }
     // Same guard as the projection layer: the HUD quad's swapchain is uninitialised until the
-    // first HUD pass, and with per-tick HUD rendering that may be a few frames in.
-    if (xr.hud_ever_rendered) {
+    // first HUD pass, and with per-tick HUD rendering that may be a few frames in. Also skip while
+    // the game has detached the overlay (hud_commands NULL — flat-screen contexts route it into
+    // the panel instead), so a stale HUD image doesn't float over the pause menu.
+    if (xr.hud_ever_rendered && xr.hud_commands != nullptr) {
         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud_layer);
     }
 
@@ -1853,6 +1994,51 @@ bool vr_get_hand_pose(int hand, float out_pos[3], float out_quat[4]) {
     return true;
 }
 
+// Controller AIM ray in game-world coords: origin + unit forward direction. The aim pose is the
+// runtime's calibrated pointing ray for the controller (subtly different from the grip pose —
+// tuned per device so "where you point" matches player intent). Same anchor + world_scale
+// composition as the grip pose, and it carries the snap-turn like everything game-facing. The
+// game converts the direction to its own binang conventions (Math_Atan2S) so engine-specific
+// pitch/yaw sign conventions stay in engine code. False (and forward = -Z) if untracked.
+bool vr_get_aim_ray(int hand, float out_pos[3], float out_dir[3]) {
+    out_pos[0] = out_pos[1] = out_pos[2] = 0.0f;
+    out_dir[0] = 0.0f;
+    out_dir[1] = 0.0f;
+    out_dir[2] = -1.0f;
+    if (hand < 0 || hand > 1 || !xr.initialized || !xr.input_initialized || !xr.hand_active[hand]) {
+        return false;
+    }
+    const XrPosef& p = xr.aim_pose[hand];
+    const glm::vec3 anchor = (xr.first_person && xr.anchor_initialized)
+                                 ? glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha)
+                                 : glm::vec3(0.0f);
+    glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+
+    // Player-tunable calibration: angle offsets (degrees, applied in the aim frame — pitch about
+    // the ray's own X, yaw about its Y) and a positional offset (meters in the aim frame, scaled
+    // to game units) so the launch point can sit exactly where the weapon's muzzle/pouch looks.
+    const float kDeg = 3.14159265358979323846f / 180.0f;
+    const float calPitch = CVarGetFloat("gVrAimCalPitch", 0.0f);
+    const float calYaw = CVarGetFloat("gVrAimCalYaw", 0.0f);
+    if (calPitch != 0.0f || calYaw != 0.0f) {
+        q = q * glm::angleAxis(calYaw * kDeg, glm::vec3(0.0f, 1.0f, 0.0f)) *
+            glm::angleAxis(calPitch * kDeg, glm::vec3(1.0f, 0.0f, 0.0f));
+    }
+    // Z negated: the CVar is "meters forward along the ray", and OpenXR aim forward is -Z.
+    const glm::vec3 off(CVarGetFloat("gVrAimOffX", 0.0f), CVarGetFloat("gVrAimOffY", 0.0f),
+                        -CVarGetFloat("gVrAimOffZ", 0.0f));
+    const glm::vec3 posOff = q * (off * xr.world_scale);
+
+    out_pos[0] = anchor.x + p.position.x * xr.world_scale + posOff.x;
+    out_pos[1] = anchor.y + p.position.y * xr.world_scale + posOff.y;
+    out_pos[2] = anchor.z + p.position.z * xr.world_scale + posOff.z;
+    const glm::vec3 d = q * glm::vec3(0.0f, 0.0f, -1.0f); // OpenXR aim forward is -Z
+    out_dir[0] = d.x;
+    out_dir[1] = d.y;
+    out_dir[2] = d.z;
+    return true;
+}
+
 bool vr_is_hand_active(int hand) {
     return (hand >= 0 && hand <= 1) && xr.input_initialized && xr.hand_active[hand];
 }
@@ -2030,8 +2216,24 @@ void vr_recenter_heading(int16_t link_yaw) {
     // rotation, so steering must not either — any captured offset rotates movement away from the
     // look direction (the old "walking sideways" bug). The game still calls this alongside
     // VR_ResetRoomscale when first-person (re)starts; there is simply nothing to do for heading.
+    // It IS the moment to re-measure the player's physical eye height though: recentering is the
+    // player's "I'm standing normally now" declaration, so auto world scale recalibrates here.
     (void)link_yaw;
     xr.heading_offset = 0;
+    xr.scale_recalibrate_requested = true;
+}
+
+// Link's standing eye height in game units (Player_GetHeight + the player's tuned head offset),
+// pushed by the game every first-person frame. Feeds auto world scale; a material change
+// (child <-> adult) triggers automatic recalibration.
+void vr_set_link_eye_height(float units) {
+    xr.link_eye_height_units = units;
+}
+
+// In-wall view fade target (0 = clear, 1 = black), set by the game per tick from how deep the
+// camera sits beyond solid geometry. Smoothed and applied at the compositor in vr_end_frame.
+void vr_set_view_fade(float fade) {
+    xr.view_fade_target = fminf(fmaxf(fade, 0.0f), 1.0f);
 }
 
 void vr_rebind_current_eye_target() {
@@ -2116,6 +2318,8 @@ void vr_end_hud() {
 }
 
 bool vr_is_rendering_hud() { return xr.rendering_hud; }
+
+bool vr_is_rendering_screen() { return xr.rendering_screen; }
 
 // --------------------------------------------------------------------------
 // Flat-screen mode (whole frame on a floating panel: file select, pause menu)
@@ -2242,6 +2446,8 @@ void vr_get_recommended_resolution(uint32_t* w, uint32_t* h) { *w = 0; *h = 0; }
 uint32_t vr_get_refresh_rate() { return 90; }
 float vr_get_world_scale() { return 1.0f; }
 void vr_set_world_scale(float) {}
+void vr_set_link_eye_height(float) {}
+void vr_set_view_fade(float) {}
 void vr_set_first_person(bool) {}
 bool vr_is_first_person() { return false; }
 void vr_set_camera_anchor(float, float, float) {}
@@ -2257,6 +2463,13 @@ void vr_add_roomscale_displacement(float, float) {}
 void vr_get_roomscale_origin(float out[2]) { out[0] = out[1] = 0.0f; }
 void vr_reset_roomscale() {}
 void vr_clamp_roomscale_lean(float) {}
+bool vr_get_aim_ray(int, float out_pos[3], float out_dir[3]) {
+    out_pos[0] = out_pos[1] = out_pos[2] = 0.0f;
+    out_dir[0] = 0.0f;
+    out_dir[1] = 0.0f;
+    out_dir[2] = -1.0f;
+    return false;
+}
 bool vr_get_hand_pose(int, float out_pos[3], float out_quat[4]) {
     out_pos[0] = out_pos[1] = out_pos[2] = 0.0f;
     out_quat[0] = out_quat[1] = out_quat[2] = 0.0f;
@@ -2294,6 +2507,7 @@ void* vr_get_hud_commands() { return nullptr; }
 void vr_begin_hud() {}
 void vr_end_hud() {}
 bool vr_is_rendering_hud() { return false; }
+bool vr_is_rendering_screen() { return false; }
 void vr_set_flat_screen(bool) {}
 bool vr_get_flat_screen() { return false; }
 void vr_begin_screen() {}

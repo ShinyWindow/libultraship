@@ -34,6 +34,7 @@
 
 #include "fast/backends/gfx_rendering_api.h"
 #include "fast/interpreter.h"
+#include "fast/vr_openxr.h"
 
 #include <prism/processor.h>
 #include "ship/config/ConsoleVariable.h"
