@@ -94,6 +94,19 @@ struct VrPhysObjectDesc {
     float speculative_m;     // constrain surfaces within this distance (before touching)
     float touch_tolerance_m; // treat as touching (impact sfx/haptics) within this distance
     float max_ang_accel;     // angular acceleration clamp, rad/s^2
+    bool pivot_only;         // contacts rotate the object about the grip, never translate it
+    float grip_local_edge_m[3]; // flat-blade half-width offset, grip-local meters; 0 = round
+    float tip_taper_frac;       // trailing fraction of the length that tapers to the point
+    // Above this mid-blade speed (m/s) contacts disengage entirely: a committed swing cuts
+    // THROUGH instead of snagging, while a gentle touch still rests on the surface. 0 = the
+    // blade never passes through. Re-engages at 70% of the threshold (hysteresis).
+    float passthrough_speed_mps;
+    // Resistance while cutting THROUGH something (passthrough active and the blade overlaps
+    // geometry): fraction of the blade's remaining catch-up distance RETAINED per 90 Hz step
+    // (frame-rate normalized). 0 = clean cut, 0.55 = the blade visibly drags through flesh
+    // and catches up on exit. Separate coefficients for enemy bodies and world geometry.
+    float cut_drag_flesh;
+    float cut_drag_world;
 };
 
 void vrphys_set_object(int slot, const VrPhysObjectDesc* desc_or_null);
@@ -116,6 +129,19 @@ int vrphys_get_object_contacts(int slot, float* out_pos_units_xyz, float* out_no
 // Flight recorder (diagnostics): while enabled, every sim step of the weapon slot is captured
 // into a ring holding the most recent ~20 s. Enabling clears it; vrphys_log_write dumps CSV and
 // empties the ring, returning the record count (0 = nothing captured, -1 = file open failed).
+// --- Visual-mesh collision (experimental) ---
+// Triangles harvested from the renderer itself: the game marks a world-space region of
+// interest around the blade each tick, and the interpreter feeds every triangle it draws
+// inside that region (world units) into a per-frame buffer that the sim merges with the
+// game-pushed prims. Mask ON while drawing things the blade must not collide with (the
+// player's own hands/weapon, the sword trail).
+void vrphys_mesh_set_region(const float center_units[3], float radius_units, bool enabled);
+void vrphys_mesh_mask(bool masked);
+bool vrphys_mesh_collecting();
+void vrphys_mesh_consider_tri(const float a[3], const float b[3], const float c[3]);
+// The harvested tris the solver actually used last step (world units, 9 floats per tri).
+int vrphys_mesh_get_debug_tris(float* out_xyz9_per_tri, int max_tris);
+
 void vrphys_log_set_enabled(bool enabled);
 int vrphys_log_count();
 int vrphys_log_write(const char* path);

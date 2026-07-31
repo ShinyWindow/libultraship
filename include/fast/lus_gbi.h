@@ -74,6 +74,11 @@ constexpr int8_t RDP_G_SETTARGETINTERPINDEX = OPCODE(0x46);
 constexpr int8_t RDP_G_LOADBLOCK_WIDE = OPCODE(0x47);
 constexpr int8_t RDP_G_VTX_WIDE = OPCODE(0x48);
 constexpr int8_t RDP_G_TRI1_WIDE = OPCODE(0x49);
+// VR physics: toggles the visual-mesh harvest mask DURING display-list execution, so a DL
+// section (the player's own arms/weapon, the sword trail) can be excluded from blade collision.
+// NOTE 0x4a is taken by RDP_G_SETTILESIZE_LERP — colliding with it desyncs every room DL that
+// scrolls textures (crash in the middle of Hyrule Field's grass).
+constexpr int8_t OTR_G_VRPHYS_MASK = OPCODE(0x4b);
 constexpr int8_t RDP_G_SETTILESIZE_LERP = OPCODE(0x4a);
 
 /*

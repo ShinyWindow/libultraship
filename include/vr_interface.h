@@ -106,7 +106,7 @@ bool     VR_GetHandMatrix(int hand, float out[4][4]);
 // Contract version of the physical-combat interface between the game and this library. Bump on any
 // breaking change to these types/functions; the game asserts equality at init so a stale submodule
 // build fails loudly instead of subtly misbehaving.
-#define VR_PHYS_INTERFACE_VERSION 6
+#define VR_PHYS_INTERFACE_VERSION 11
 int32_t VR_PhysGetInterfaceVersion(void);
 
 // Latest hand velocity: linear in physical meters/second (independent of world scale and Link's
@@ -168,8 +168,31 @@ typedef struct VrHeldObjectDesc {
     float speculativeM;     // constrain surfaces within this distance BEFORE touching them
     float touchToleranceM;  // counts as touching, for impact effects
     float maxAngAccel;      // angular acceleration ceiling, rad/s^2 (stability backstop)
+    int32_t pivotOnly;      // nonzero: contacts may only ROTATE the object about the grip —
+                            // the grip position always tracks the hand (never pushed back)
+    // Flat-blade cross-section. With a nonzero edge vector the collider is a RECTANGLE (two
+    // long edges + spine, each bladeRadiusM thick) instead of one round capsule, tapering to
+    // the tip point over the last tipTaperFrac of the length.
+    float gripLocalEdgeM[3]; // half-width offset (grip-local meters); zero = round blade
+    float tipTaperFrac;      // 0 = square tip, 0.2 = pointed over the last 20% of the blade
+    float passthroughSpeedMps; // fast swings above this mid-blade speed cut THROUGH geometry
+                               // instead of snagging; gentle contact still rests. 0 = never.
+    float cutDragFlesh;        // resistance while cutting through enemy bodies (0..1 retained
+                               // per 90Hz step: 0 = clean cut, ~0.55 = heavy flesh drag)
+    float cutDragWorld;        // same, for world geometry the swing passes through
 } VrHeldObjectDesc;
 void VR_PhysSetObject(int slot, const VrHeldObjectDesc* descOrNull);
+
+// EXPERIMENTAL visual-mesh collision: while enabled, the renderer harvests every triangle it
+// draws within radiusUnits of centerUnits (world space, game units) and the sim collides the
+// blade against the nearest of them — the geometry you SEE, animated enemies included, instead
+// of the simplified collision mesh. Call once per game tick (center follows the weapon hand).
+// Mask ON around draws the blade must ignore (the player's own arms/weapon, the sword trail).
+void VR_PhysSetMeshRegion(const float centerUnits[3], float radiusUnits, int32_t enabled);
+void VR_PhysMeshMask(int32_t masked);
+// Debug: the harvested triangles the solver collided against last step (world units, 9 floats
+// per triangle). Returns the count written (up to maxTris).
+int32_t VR_PhysGetMeshDebugTris(float* outXyz9PerTri, int32_t maxTris);
 
 // Contact primitives, world space / game units, re-pushed each game tick: level geometry planes
 // and the colliders a blade must not pass through (armor, shields). Max 24; excess dropped.

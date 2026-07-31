@@ -26,6 +26,7 @@
 
 #include "fast/interpreter.h"
 #include "fast/lus_gbi.h"
+#include "fast/vr_physics.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
 #include "fast/vr_openxr.h"
@@ -1592,12 +1593,15 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                   v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
 
         float world_pos[3] = { 0.0 };
-        if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
+        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || vrphys_mesh_collecting()) {
             float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
         }
+        d->world[0] = world_pos[0];
+        d->world[1] = world_pos[1];
+        d->world[2] = world_pos[2];
 
         x = AdjXForAspectRatio(x);
 
@@ -1776,6 +1780,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
+
+    // VR physics visual-mesh harvest: capture the triangle in WORLD space before any screen
+    // culling — geometry behind the camera or off-screen still physically exists for the
+    // blade. Rect slots carry no world positions, so they never harvest.
+    if (!is_rect && vrphys_mesh_collecting() && vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES &&
+        vtx3_idx < MAX_VERTICES) {
+        vrphys_mesh_consider_tri(v1->world, v2->world, v3->world);
+    }
 
     // if (rand()%2) return;
 
@@ -4234,6 +4246,13 @@ bool gfx_set_grayscale_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+bool gfx_vrphys_mask_handler_custom(F3DGfx** cmd0) {
+    F3DGfx* cmd = *cmd0;
+
+    vrphys_mesh_mask(cmd->words.w1 != 0);
+    return false;
+}
+
 bool gfx_load_block_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4701,6 +4720,7 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_TEXRECT_WIDE, { "G_TEXRECT_WIDE", gfx_tex_rect_wide_handler_custom } },          // G_TEXRECT_WIDE (0x37)
     { OTR_G_FILLWIDERECT, { "G_FILLWIDERECT", gfx_fill_wide_rect_handler_custom } },         // G_FILLWIDERECT (0x38)
     { OTR_G_SETGRAYSCALE, { "G_SETGRAYSCALE", gfx_set_grayscale_handler_custom } },          // G_SETGRAYSCALE (0x39)
+    { OTR_G_VRPHYS_MASK, { "G_VRPHYS_MASK", gfx_vrphys_mask_handler_custom } },              // G_VRPHYS_MASK (0x4a)
     { OTR_G_EXTRAGEOMETRYMODE,
       { "G_EXTRAGEOMETRYMODE", gfx_extra_geometry_mode_handler_custom } }, // G_EXTRAGEOMETRYMODE (0x3a)
     { OTR_G_COPYFB, { "G_COPYFB", gfx_copy_fb_handler_custom } },          // G_COPYFB (0x3b)

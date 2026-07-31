@@ -219,6 +219,10 @@ struct LoadedVertex {
     float u, v;
     struct RGBA color;
     uint8_t clip_rej;
+    // World-space position (game units), valid while the VR physics visual-mesh harvest is
+    // collecting (also filled for positional lighting). Model transforms live alone in the
+    // modelview stack here (view+projection are in P), so this IS world space.
+    float world[3];
 };
 
 struct RawTexMetadata {

@@ -211,7 +211,27 @@ void VR_PhysSetObject(int slot, const VrHeldObjectDesc* descOrNull) {
     tmp.speculative_m = d.speculativeM;
     tmp.touch_tolerance_m = d.touchToleranceM;
     tmp.max_ang_accel = d.maxAngAccel;
+    tmp.pivot_only = d.pivotOnly != 0;
+    tmp.grip_local_edge_m[0] = d.gripLocalEdgeM[0];
+    tmp.grip_local_edge_m[1] = d.gripLocalEdgeM[1];
+    tmp.grip_local_edge_m[2] = d.gripLocalEdgeM[2];
+    tmp.tip_taper_frac = d.tipTaperFrac;
+    tmp.passthrough_speed_mps = d.passthroughSpeedMps;
+    tmp.cut_drag_flesh = d.cutDragFlesh;
+    tmp.cut_drag_world = d.cutDragWorld;
     vrphys_set_object(slot, &tmp);
+}
+
+void VR_PhysSetMeshRegion(const float centerUnits[3], float radiusUnits, int32_t enabled) {
+    vrphys_mesh_set_region(centerUnits, radiusUnits, enabled != 0);
+}
+
+void VR_PhysMeshMask(int32_t masked) {
+    vrphys_mesh_mask(masked != 0);
+}
+
+int32_t VR_PhysGetMeshDebugTris(float* outXyz9PerTri, int32_t maxTris) {
+    return vrphys_mesh_get_debug_tris(outXyz9PerTri, maxTris);
 }
 
 void VR_PhysSetContactPrims(const VrContactPrim* prims, int32_t count) {

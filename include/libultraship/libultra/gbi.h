@@ -2830,6 +2830,18 @@ typedef union Gfx {
 #define gsSPGrayscale(state) \
     { (_SHIFTL(G_SETGRAYSCALE, 24, 8)), (state) }
 
+// VR physics visual-mesh harvest mask (see OTR_G_VRPHYS_MASK). 0x4a = G_SETTILESIZE_LERP.
+#define G_VRPHYS_MASK 0x4b
+#define gSPVrPhysMask(pkt, state)                      \
+    {                                                  \
+        Gfx* _g = (Gfx*)(pkt);                         \
+                                                       \
+        _g->words.w0 = _SHIFTL(G_VRPHYS_MASK, 24, 8);  \
+        _g->words.w1 = (state);                        \
+    }
+#define gsSPVrPhysMask(state) \
+    { (_SHIFTL(G_VRPHYS_MASK, 24, 8)), (state) }
+
 #define gsSPPushShader(shader)                                  \
     { (_SHIFTL(G_PUSH_SHADER, 24, 8)), (uintptr_t)(shader) }, { \
         0, 0                                                    \

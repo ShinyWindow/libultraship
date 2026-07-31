@@ -307,6 +307,7 @@ struct SlotState {
     V3 tgt_ang_vel_rps;
     // Contact + output state
     bool in_contact;
+    bool passthrough; // fast-swing state: contacts disengaged until the swing slows down
     // Active contacts from the latest solve (RAW space): the spring projects its drive off these
     // normals next step, and the debug overlay draws them.
     V3 contact_pts[4];
@@ -323,6 +324,26 @@ struct SlotState {
 // step with that step's context.
 VrPhysContactPrim g_prims[VRPHYS_MAX_CONTACT_PRIMS];
 int g_prim_count = 0;
+
+// ---- Visual-mesh harvest (experimental) ----
+// World-unit triangles captured by the interpreter while it draws, double-buffered per XR
+// frame: the sim (which steps BEFORE the frame draws) reads the buffer the renderer just
+// finished, and the renderer fills the other side.
+struct MeshTri {
+    V3 a, b, c;
+};
+constexpr int kMeshCap = 4096;
+constexpr int kMeshSelect = 32; // nearest tris fed to the solver each step
+MeshTri g_mesh_buf[2][kMeshCap];
+int g_mesh_count[2] = { 0, 0 };
+int g_mesh_write = 0;
+bool g_mesh_enabled = false;
+bool g_mesh_masked = false;
+V3 g_mesh_center = kV3Zero; // world units
+float g_mesh_radius = 0.0f;
+// The tris actually fed to the solver last step (world units), for the debug overlay.
+MeshTri g_mesh_dbg[kMeshSelect];
+int g_mesh_dbg_count = 0;
 
 VrPhysEvent g_events[kEventCap];
 int g_event_count = 0;
@@ -520,11 +541,15 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         float radius_m;
         int id;
     };
-    RawPrim raw_prims[VRPHYS_MAX_CONTACT_PRIMS];
+    RawPrim raw_prims[VRPHYS_MAX_CONTACT_PRIMS + kMeshSelect];
     const Q4 turn_inv = qconj(g_ctx.turn_rot);
     const float inv_scale = 1.0f / (g_ctx.world_scale > 1.0f ? g_ctx.world_scale : 35.0f);
     auto world_to_raw = [&](const V3& w) -> V3 {
         return qrot(turn_inv, sub(mul(sub(w, g_ctx.anchor_units), inv_scale), g_ctx.turn_off_m));
+    };
+    auto raw_to_world = [&](const V3& p) -> V3 {
+        return add(g_ctx.anchor_units,
+                   mul(qrot(g_ctx.turn_rot, add(p, g_ctx.turn_off_m)), 1.0f / inv_scale));
     };
     for (int i = 0; i < g_prim_count; i++) {
         raw_prims[i].type = g_prims[i].type;
@@ -534,6 +559,88 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         raw_prims[i].c = (g_prims[i].type == VRPHYS_PRIM_TRI) ? world_to_raw(v3(g_prims[i].c)) : kV3Zero;
         raw_prims[i].radius_m = g_prims[i].radius * inv_scale;
         raw_prims[i].id = g_prims[i].id;
+    }
+    int n_work = g_prim_count;
+
+    // Visual-mesh merge: read the tri buffer the renderer finished last frame, flip the write
+    // side for the upcoming draw, and append the nearest tris to the blade. Ranked by centroid
+    // distance to the blade segment minus tri radius (conservative), in world units.
+    if (g_mesh_enabled) {
+        const int read_side = g_mesh_write;
+        g_mesh_write ^= 1;
+        g_mesh_count[g_mesh_write] = 0;
+        g_mesh_masked = false; // never let a lost pop-marker mask a whole frame
+        const SlotState& wsl = g_slots[VRPHYS_SLOT_WEAPON];
+        if (wsl.active && wsl.state_valid && g_mesh_count[read_side] > 0) {
+            const V3 br = raw_to_world(add(wsl.pos_m, qrot(wsl.quat, v3(wsl.desc.grip_local_root_m))));
+            const V3 bt = raw_to_world(add(wsl.pos_m, qrot(wsl.quat, v3(wsl.desc.grip_local_tip_m))));
+            struct Sel {
+                float rank;
+                int idx;
+            };
+            // Stickiness, the other collision-gather lesson: prefer the tris chosen LAST step
+            // so the constraint set stays put instead of reshuffling every frame (a member
+            // that blinks out for one step lets the target sink, and the snap-back is the
+            // churn jitter). Last step's picks are in g_mesh_dbg; match by centroid.
+            const int prev_count = g_mesh_dbg_count;
+            V3 prev_cen[kMeshSelect];
+            for (int p = 0; p < prev_count; p++) {
+                prev_cen[p] =
+                    mul(add(add(g_mesh_dbg[p].a, g_mesh_dbg[p].b), g_mesh_dbg[p].c), 1.0f / 3.0f);
+            }
+            const float sticky_bias = 8.0f; // world units of rank preference
+            Sel sel[kMeshSelect];
+            int nsel = 0;
+            for (int i = 0; i < g_mesh_count[read_side]; i++) {
+                const MeshTri& mt = g_mesh_buf[read_side][i];
+                const V3 cen = mul(add(add(mt.a, mt.b), mt.c), 1.0f / 3.0f);
+                const float tri_r =
+                    fmaxf(len(sub(mt.a, cen)), fmaxf(len(sub(mt.b, cen)), len(sub(mt.c, cen))));
+                float d = len(sub(cen, closest_on_seg(cen, br, bt))) - tri_r;
+                for (int p = 0; p < prev_count; p++) {
+                    if (len(sub(cen, prev_cen[p])) < 0.5f) {
+                        d -= sticky_bias;
+                        break;
+                    }
+                }
+                if (nsel == kMeshSelect && d >= sel[nsel - 1].rank) {
+                    continue;
+                }
+                int at = (nsel < kMeshSelect) ? nsel++ : kMeshSelect - 1;
+                while (at > 0 && sel[at - 1].rank > d) {
+                    sel[at] = sel[at - 1];
+                    at--;
+                }
+                sel[at] = { d, i };
+            }
+            g_mesh_dbg_count = 0;
+            for (int s = 0; s < nsel && n_work < (int)(sizeof(raw_prims) / sizeof(raw_prims[0])); s++) {
+                const MeshTri& mt = g_mesh_buf[read_side][sel[s].idx];
+                // Both eyes render (and harvest) the same geometry: drop exact duplicates so
+                // they don't burn selection slots.
+                const V3 cen = mul(add(add(mt.a, mt.b), mt.c), 1.0f / 3.0f);
+                bool dup = false;
+                for (int q = 0; q < g_mesh_dbg_count; q++) {
+                    const V3 qcen = mul(add(add(g_mesh_dbg[q].a, g_mesh_dbg[q].b), g_mesh_dbg[q].c),
+                                        1.0f / 3.0f);
+                    if (len(sub(cen, qcen)) < 0.05f && len(sub(mt.a, g_mesh_dbg[q].a)) < 0.05f) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) {
+                    continue;
+                }
+                RawPrim& rp = raw_prims[n_work++];
+                rp.type = VRPHYS_PRIM_TRI;
+                rp.a = world_to_raw(mt.a);
+                rp.b = world_to_raw(mt.b);
+                rp.c = world_to_raw(mt.c);
+                rp.radius_m = 0.0f;
+                rp.id = 1 << 12; // generic wall material
+                g_mesh_dbg[g_mesh_dbg_count++] = mt;
+            }
+        }
     }
 
     // Advance the held-object springs toward their hand targets (raw tracking space).
@@ -635,6 +742,33 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         const V3 tip_local = v3(sl.desc.grip_local_tip_m);
         const bool has_segment = len(sub(tip_local, root_local)) > 1e-4f;
         const float blade_len = len(sub(tip_local, root_local));
+
+        // Blade cross-section (grip-local). With a width vector the collider is a FLAT BLADE:
+        // the two long edges plus the spine, each blade_r thick, with the edges converging to
+        // the tip point over the last tip_taper_frac of the length. The flat side rests flat
+        // (both edges touch), edge-on contact bites like an edge, and glancing stabs slide
+        // off the point. Without a width vector this reduces to the single round capsule.
+        V3 seg_root[5];
+        V3 seg_tip[5];
+        int nsegs = 0;
+        if (has_segment) {
+            seg_root[nsegs] = root_local;
+            seg_tip[nsegs++] = tip_local;
+            const V3 half_w = v3(sl.desc.grip_local_edge_m);
+            if (len(half_w) > 1e-4f) {
+                const float taper = clamp01(sl.desc.tip_taper_frac);
+                const V3 taper_pt = add(root_local, mul(sub(tip_local, root_local), 1.0f - taper));
+                for (int e = 0; e < 2; e++) {
+                    const V3 off = (e == 0) ? half_w : mul(half_w, -1.0f);
+                    seg_root[nsegs] = add(root_local, off);
+                    seg_tip[nsegs++] = add(taper_pt, off);
+                    if (taper > 0.01f) { // edge corner -> the point
+                        seg_root[nsegs] = add(taper_pt, off);
+                        seg_tip[nsegs++] = tip_local;
+                    }
+                }
+            }
+        }
         const float blade_r = sl.desc.blade_radius_m > 0.0f ? sl.desc.blade_radius_m : kBladeRadiusM;
         const float touch_m =
             sl.desc.touch_tolerance_m > 0.0f ? sl.desc.touch_tolerance_m : kTouchToleranceM;
@@ -646,9 +780,75 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         V3 ev_p = sl.pos_m;
         int ev_id = 0;
 
-        if (!sl.desc.contact_enabled || !has_segment || g_prim_count == 0) {
-            sl.pos_m = sl.tgt_pos_m;
-            sl.quat = sl.tgt_quat;
+        // Fast-swing pass-through: a committed swing (mid-blade speed above the threshold,
+        // from the HAND's velocities — the collision-free intent, so contact cannot gate its
+        // own release) cuts through geometry instead of snagging; damage comes from the swept
+        // quads either way. Hysteresis: re-engage only once the swing decays to 70%.
+        if (sl.desc.passthrough_speed_mps > 0.0f && has_segment) {
+            const V3 mid_r = qrot(qnorm(target_quat), mul(add(root_local, tip_local), 0.5f));
+            const float sp = len(add(target_vel, vcross(h.pend_ang_vel, mid_r)));
+            if (sl.passthrough) {
+                if (sp < sl.desc.passthrough_speed_mps * 0.7f) {
+                    sl.passthrough = false;
+                }
+            } else if (sp > sl.desc.passthrough_speed_mps) {
+                sl.passthrough = true;
+            }
+        } else {
+            sl.passthrough = false;
+        }
+
+        if (!sl.desc.contact_enabled || !has_segment || n_work == 0 || sl.passthrough) {
+            // Cut resistance: while a committed swing is passing THROUGH something, the blade
+            // is held back — it covers only part of its catch-up distance to the hand each
+            // step while overlapping, then catches up cleanly on exit. Frame-rate normalized
+            // (coefficients are "fraction retained per 90 Hz step"). Flesh drags harder than
+            // world geometry, and the cut rumbles continuously in the hand.
+            float drag = 0.0f;
+            if (sl.passthrough && (sl.desc.cut_drag_flesh > 0.0f || sl.desc.cut_drag_world > 0.0f)) {
+                const V3 r0 = add(sl.pos_m, qrot(sl.quat, root_local));
+                const V3 r1 = add(sl.pos_m, qrot(sl.quat, tip_local));
+                for (int i = 0; i < n_work; i++) {
+                    const RawPrim& pr = raw_prims[i];
+                    bool overlap = false;
+                    if (pr.type == VRPHYS_PRIM_TRI) {
+                        float pen;
+                        V3 n, cp;
+                        if (seg_tri_contact(r0, r1, pr.a, pr.b, pr.c, blade_r, pen, n, cp)) {
+                            overlap = pen > -0.01f;
+                        }
+                    } else if (pr.type == VRPHYS_PRIM_CAPSULE) {
+                        V3 pa, pb;
+                        closest_seg_seg(r0, r1, pr.a, pr.b, pa, pb);
+                        overlap = len(sub(pa, pb)) < blade_r + pr.radius_m + 0.01f;
+                    } else if (pr.type == VRPHYS_PRIM_SPHERE) {
+                        overlap = len(sub(closest_on_seg(pr.a, r0, r1), pr.a)) <
+                                  blade_r + pr.radius_m + 0.01f;
+                    }
+                    if (overlap) {
+                        const int kind = pr.id >> 12;
+                        const float k = (kind == 3) ? clamp01(sl.desc.cut_drag_flesh)
+                                                    : clamp01(sl.desc.cut_drag_world);
+                        drag = fmaxf(drag, k);
+                    }
+                }
+            }
+            if (drag > 0.0f) {
+                const float retention = powf(drag, dt_s * 90.0f);
+                sl.pos_m = add(sl.tgt_pos_m, mul(sub(sl.pos_m, sl.tgt_pos_m), retention));
+                const V3 aerr = q_error_vec(sl.tgt_quat, sl.quat);
+                sl.quat = q_integrate(sl.quat, mul(aerr, 1.0f - retention), 1.0f);
+                if (g_haptic_count < kHapticCap) {
+                    VrPhysHapticReq& hr = g_haptics[g_haptic_count++];
+                    hr.hand = sl.desc.primary_hand;
+                    hr.amplitude01 = clamp01(0.2f + 0.5f * drag);
+                    hr.freq_hz = 0.0f;
+                    hr.duration_ms = 25.0f; // re-armed every step: reads as continuous
+                }
+            } else {
+                sl.pos_m = sl.tgt_pos_m;
+                sl.quat = sl.tgt_quat;
+            }
         } else {
             // Resolve the blade out of everything it overlaps at its CURRENT pose, moving along
             // each contact normal. Pure geometry: no impulses, no stored energy, so this can
@@ -661,7 +861,7 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
             // falls on distinguishes "inside the solid" from "hanging past a convex edge".
             auto same_vert = [](const V3& a, const V3& b) { return len(sub(a, b)) < 1e-3f; };
             auto find_shared_tri = [&](int self, const V3& e0, const V3& e1) -> int {
-                for (int j = 0; j < g_prim_count; j++) {
+                for (int j = 0; j < n_work; j++) {
                     if (j == self || raw_prims[j].type != VRPHYS_PRIM_TRI) {
                         continue;
                     }
@@ -714,7 +914,7 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
             auto depenetrate = [&](int iterations, bool record) {
                 for (int it = 0; it < iterations; it++) {
                     bool moved = false;
-                    for (int i = 0; i < g_prim_count; i++) {
+                    for (int i = 0; i < n_work; i++) {
                         const RawPrim& pr = raw_prims[i];
                         V3 tn = { 0.0f, 1.0f, 0.0f };
                         if (pr.type == VRPHYS_PRIM_TRI) {
@@ -726,13 +926,18 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                             tn = mul(tn_raw, 1.0f / tn_l);
                         }
                         constexpr int kSamples = 5;
+                        // Per blade segment (spine + flat-blade edges); within each:
                         // m: 0..kSamples-1 point samples, kSamples = interior crossing,
-                        // kSamples+1..kSamples+3 = blade segment vs the tri's three edges
+                        // kSamples+1..kSamples+3 = segment vs the tri's three edges
                         // (the continuous contact that lets the blade rest on and pivot
                         // around a ledge lip between point samples).
+                        for (int si = 0; si < nsegs; si++)
                         for (int m = 0; m <= kSamples + 3; m++) {
-                            const V3 rootNow = add(sl.pos_m, qrot(sl.quat, root_local));
-                            const V3 tipNow = add(sl.pos_m, qrot(sl.quat, tip_local));
+                            const V3 rootNow = add(sl.pos_m, qrot(sl.quat, seg_root[si]));
+                            const V3 tipNow = add(sl.pos_m, qrot(sl.quat, seg_tip[si]));
+                            if (len(sub(tipNow, rootNow)) < 1e-5f) {
+                                continue; // degenerate (zero-taper corner segment)
+                            }
                             float pen;
                             V3 n;
                             V3 cp;
@@ -866,23 +1071,41 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                             }
 #endif
 
-                            // Positional correction split between translation and rotation by the
-                            // lever arm. Full correction: substeps keep each one tiny.
                             const V3 r = sub(cp, sl.pos_m);
                             const V3 rxn = vcross(r, n);
-                            const float k_n = 1.0f + vdot(rxn, rxn) / inertia;
                             float depth = pen;
                             if (depth > kCorrectionCapM) {
                                 depth = kCorrectionCapM;
                             }
-                            const float lambda = depth / k_n;
-                            sl.pos_m = add(sl.pos_m, mul(n, lambda));
-                            V3 dtheta = mul(rxn, lambda / inertia);
-                            const float dtl = len(dtheta);
-                            if (dtl > 0.2f) {
-                                dtheta = mul(dtheta, 0.2f / dtl);
+                            if (sl.desc.pivot_only) {
+                                // The grip is nailed to the hand: resolve by rotating about it
+                                // only. A contact needs a usable lever (|r x n| = the arm the
+                                // rotation acts through); without one no orientation change can
+                                // clear it, so let it clip rather than churn the blade.
+                                const float denom = vdot(rxn, rxn);
+                                const float min_lever = 0.15f * blade_len;
+                                if (denom < min_lever * min_lever) {
+                                    continue;
+                                }
+                                V3 dtheta = mul(rxn, depth / denom);
+                                const float dtl = len(dtheta);
+                                if (dtl > 0.15f) {
+                                    dtheta = mul(dtheta, 0.15f / dtl);
+                                }
+                                sl.quat = q_integrate(sl.quat, dtheta, 1.0f);
+                            } else {
+                                // Correction split between translation and rotation by the lever
+                                // arm. Full correction: substeps keep each one tiny.
+                                const float k_n = 1.0f + vdot(rxn, rxn) / inertia;
+                                const float lambda = depth / k_n;
+                                sl.pos_m = add(sl.pos_m, mul(n, lambda));
+                                V3 dtheta = mul(rxn, lambda / inertia);
+                                const float dtl = len(dtheta);
+                                if (dtl > 0.2f) {
+                                    dtheta = mul(dtheta, 0.2f / dtl);
+                                }
+                                sl.quat = q_integrate(sl.quat, dtheta, 1.0f);
                             }
-                            sl.quat = q_integrate(sl.quat, dtheta, 1.0f);
                         }
                     }
                     if (!moved) {
@@ -908,6 +1131,55 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                 sl.quat = q_integrate(sl.quat, drot_step, 1.0f);
                 depenetrate(3, sIdx == nsub - 1);
             }
+
+            // Friction: drag at the recorded contacts. Each touching contact gives back a
+            // fraction of the tangential distance its blade material point slid this step,
+            // applied as the same grip-pivot rotation the normal corrections use — so the
+            // blade angle "sticks" and trails while scraping along a surface, but the grip
+            // itself never resists the hand. Position-based (a fraction of displacement, not
+            // a force), so it cannot ring any more than the depenetration can.
+            const float fric = clamp01(sl.desc.friction);
+            if (sl.desc.pivot_only && fric > 0.0f && sl.contact_count > 0) {
+                bool dragged = false;
+                for (int c = 0; c < sl.contact_count; c++) {
+                    if (sl.contact_pens[c] <= -touch_m) {
+                        continue; // speculative-band entry, not actually touching
+                    }
+                    const V3 cp = sl.contact_pts[c];
+                    const V3 n = sl.contact_ns[c];
+                    // Slide = the HAND-driven motion of the contact point this step (target
+                    // velocities, not the blade's own). Measuring the blade's actual motion
+                    // here feeds the friction rotation back into next step's "slide" and winds
+                    // the angle up until geometry saturates it — the drag must oppose only
+                    // what the player is doing, not what the solver did.
+                    const V3 r_cp = sub(cp, sl.pos_m);
+                    const V3 v_pt = add(sl.tgt_vel_mps, vcross(sl.tgt_ang_vel_rps, r_cp));
+                    const V3 disp = mul(v_pt, dt_s);
+                    const V3 slide = sub(disp, mul(n, vdot(disp, n)));
+                    const float mag = len(slide);
+                    if (mag < 1e-6f) {
+                        continue;
+                    }
+                    const V3 t = mul(slide, 1.0f / mag);
+                    const V3 r = sub(cp, sl.pos_m);
+                    const V3 lever = vcross(r, t);
+                    const float denom = vdot(lever, lever);
+                    const float min_lever = 0.15f * blade_len;
+                    if (denom < min_lever * min_lever) {
+                        continue;
+                    }
+                    V3 dtheta = mul(lever, -fric * mag / denom);
+                    const float dtl = len(dtheta);
+                    if (dtl > 0.05f) {
+                        dtheta = mul(dtheta, 0.05f / dtl);
+                    }
+                    sl.quat = q_integrate(sl.quat, dtheta, 1.0f);
+                    dragged = true;
+                }
+                if (dragged) {
+                    depenetrate(2, false); // the drag rotation may have re-pressed a surface
+                }
+            }
         }
 
         // Velocities are DERIVED, never integrated — nothing to store, nothing to ring.
@@ -915,10 +1187,10 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         sl.ang_vel_rps = mul(q_error_vec(sl.quat, prev_quat), 1.0f / dt_s);
 
         // Impact strength = how much of the motion the surface actually refused this step.
-        {
-            const V3 blocked = sub(sl.tgt_pos_m, sl.pos_m);
-            const float b = len(blocked);
-            if (ntouch > 0 && b > 0.0f) {
+        if (ntouch > 0) {
+            if (sl.desc.pivot_only) {
+                max_impact = len(q_error_vec(sl.tgt_quat, sl.quat)) * blade_len / dt_s * 0.25f;
+            } else if (len(sub(sl.tgt_pos_m, sl.pos_m)) > 0.0f) {
                 max_impact = len(sub(mul(sub(sl.pos_m, prev_pos), 1.0f / dt_s),
                                      mul(sub(sl.tgt_pos_m, prev_pos), 1.0f / dt_s)));
             }
@@ -993,7 +1265,7 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
             v3_store(to_world_units(add(sl.pos_m, qrot(sl.quat, root_local)), g_ctx), r.root);
             v3_store(to_world_units(add(sl.pos_m, qrot(sl.quat, tip_local)), g_ctx), r.tip);
             r.nc = sl.contact_count;
-            r.nprims = g_prim_count;
+            r.nprims = n_work;
             r.prim_hash = g_prim_hash;
             for (int ci = 0; ci < sl.contact_count && ci < 4; ci++) {
                 v3_store(sl.contact_ns[ci], r.c[ci].n);
@@ -1192,6 +1464,72 @@ bool vrphys_get_hand_sim_pose_raw(int hand, float out_pos_m[3], float out_quat_x
 // --------------------------------------------------------------------------
 // Contact primitives, blade path, events, haptics
 // --------------------------------------------------------------------------
+
+void vrphys_mesh_set_region(const float center_units[3], float radius_units, bool enabled) {
+    g_mesh_enabled = enabled && center_units != nullptr && radius_units > 0.0f;
+    if (!g_mesh_enabled) {
+        g_mesh_count[0] = g_mesh_count[1] = 0;
+        return;
+    }
+    g_mesh_center = v3(center_units);
+    g_mesh_radius = radius_units;
+}
+
+void vrphys_mesh_mask(bool masked) {
+    g_mesh_masked = masked;
+}
+
+bool vrphys_mesh_collecting() {
+    return g_mesh_enabled && !g_mesh_masked;
+}
+
+int vrphys_mesh_get_debug_tris(float* out_xyz9_per_tri, int max_tris) {
+    const int n = g_mesh_dbg_count < max_tris ? g_mesh_dbg_count : max_tris;
+    for (int i = 0; i < n; i++) {
+        v3_store(g_mesh_dbg[i].a, out_xyz9_per_tri + i * 9);
+        v3_store(g_mesh_dbg[i].b, out_xyz9_per_tri + i * 9 + 3);
+        v3_store(g_mesh_dbg[i].c, out_xyz9_per_tri + i * 9 + 6);
+    }
+    return n;
+}
+
+void vrphys_mesh_consider_tri(const float a[3], const float b[3], const float c[3]) {
+    int& cnt = g_mesh_count[g_mesh_write];
+    if (cnt >= kMeshCap) {
+        return;
+    }
+    const float r = g_mesh_radius;
+    const V3 va = v3(a), vb = v3(b), vc = v3(c);
+    // Region reject on the tri's AABB (world units).
+    const float minx = fminf(va.x, fminf(vb.x, vc.x)), maxx = fmaxf(va.x, fmaxf(vb.x, vc.x));
+    if (maxx < g_mesh_center.x - r || minx > g_mesh_center.x + r) {
+        return;
+    }
+    const float miny = fminf(va.y, fminf(vb.y, vc.y)), maxy = fmaxf(va.y, fmaxf(vb.y, vc.y));
+    if (maxy < g_mesh_center.y - r || miny > g_mesh_center.y + r) {
+        return;
+    }
+    const float minz = fminf(va.z, fminf(vb.z, vc.z)), maxz = fmaxf(va.z, fmaxf(vb.z, vc.z));
+    if (maxz < g_mesh_center.z - r || minz > g_mesh_center.z + r) {
+        return;
+    }
+    // BACK-FACE rejection, the lesson the collision-mesh gather already taught: the harvest
+    // sphere reaches through walls, and the far side of a wall (or the world's outer shell)
+    // pushes the opposite way from the face the blade is actually touching — feeding the
+    // solver both is the flat-surface jitter. Rendered geometry is one-sided (CCW front), so
+    // drop faces whose front does not look at the hand region. Double-sided decor is drawn
+    // as two windings, and the facing copy survives.
+    const V3 n = vcross(sub(vb, va), sub(vc, va));
+    const float n_len = len(n);
+    if (n_len < 1e-6f) {
+        return; // degenerate
+    }
+    const float back_margin = 4.0f; // world units, matches the collision gather's kBackMargin
+    if (vdot(n, sub(g_mesh_center, va)) < -back_margin * n_len) {
+        return;
+    }
+    g_mesh_buf[g_mesh_write][cnt++] = { va, vb, vc };
+}
 
 void vrphys_set_contact_prims(const VrPhysContactPrim* prims, int count) {
     if (prims == nullptr || count <= 0) {
