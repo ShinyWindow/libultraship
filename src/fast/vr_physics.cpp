@@ -1,0 +1,1268 @@
+#include "fast/vr_physics.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Self-contained vec3/quat helpers (floats, x/y/z/w quats). Deliberately NOT glm: this file is
+// compiled on every platform, and glm only resolves transitively on the Windows/vcpkg setup that
+// builds the OpenXR layer. The handful of operations a spring-damper needs fits in a page.
+namespace {
+
+struct V3 {
+    float x, y, z;
+};
+struct Q4 {
+    float x, y, z, w;
+};
+
+constexpr V3 kV3Zero = { 0.0f, 0.0f, 0.0f };
+constexpr Q4 kQIdent = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+inline V3 v3(const float* p) {
+    return { p[0], p[1], p[2] };
+}
+inline void v3_store(const V3& v, float* out) {
+    out[0] = v.x;
+    out[1] = v.y;
+    out[2] = v.z;
+}
+inline V3 add(const V3& a, const V3& b) {
+    return { a.x + b.x, a.y + b.y, a.z + b.z };
+}
+inline V3 sub(const V3& a, const V3& b) {
+    return { a.x - b.x, a.y - b.y, a.z - b.z };
+}
+inline V3 mul(const V3& a, float s) {
+    return { a.x * s, a.y * s, a.z * s };
+}
+inline float len(const V3& a) {
+    return sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
+}
+inline float vdot(const V3& a, const V3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+inline V3 vcross(const V3& a, const V3& b) {
+    return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+}
+inline float clamp01(float v) {
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+// Closest point to p on segment ab.
+inline V3 closest_on_seg(const V3& p, const V3& a, const V3& b) {
+    const V3 ab = sub(b, a);
+    const float len2 = vdot(ab, ab);
+    if (len2 < 1e-12f) {
+        return a;
+    }
+    float t = vdot(sub(p, a), ab) / len2;
+    t = clamp01(t);
+    return add(a, mul(ab, t));
+}
+// Closest points between segments a0a1 and b0b1 (out_a on the first, out_b on the second).
+inline void closest_seg_seg(const V3& a0, const V3& a1, const V3& b0, const V3& b1, V3& out_a, V3& out_b) {
+    const V3 d1 = sub(a1, a0);
+    const V3 d2 = sub(b1, b0);
+    const V3 r = sub(a0, b0);
+    const float A = vdot(d1, d1), E = vdot(d2, d2), F = vdot(d2, r);
+    float s, t;
+    if (A < 1e-12f && E < 1e-12f) {
+        s = t = 0.0f;
+    } else if (A < 1e-12f) {
+        s = 0.0f;
+        t = clamp01(F / E);
+    } else {
+        const float C = vdot(d1, r);
+        if (E < 1e-12f) {
+            t = 0.0f;
+            s = clamp01(-C / A);
+        } else {
+            const float B = vdot(d1, d2);
+            const float denom = A * E - B * B;
+            s = (denom > 1e-12f) ? clamp01((B * F - C * E) / denom) : 0.0f;
+            t = clamp01((B * s + F) / E);
+            s = clamp01((B * t - C) / A);
+        }
+    }
+    out_a = add(a0, mul(d1, s));
+    out_b = add(b0, mul(d2, t));
+}
+// Point inside triangle (p assumed near the tri's plane; n = unit normal).
+inline bool point_in_tri(const V3& p, const V3& a, const V3& b, const V3& c, const V3& n) {
+    if (vdot(vcross(sub(b, a), sub(p, a)), n) < 0.0f) {
+        return false;
+    }
+    if (vdot(vcross(sub(c, b), sub(p, b)), n) < 0.0f) {
+        return false;
+    }
+    if (vdot(vcross(sub(a, c), sub(p, c)), n) < 0.0f) {
+        return false;
+    }
+    return true;
+}
+// Closest point on triangle abc to p (n = unit normal).
+inline V3 closest_on_tri(const V3& p, const V3& a, const V3& b, const V3& c, const V3& n) {
+    const V3 proj = sub(p, mul(n, vdot(sub(p, a), n)));
+    if (point_in_tri(proj, a, b, c, n)) {
+        return proj;
+    }
+    const V3 e0 = closest_on_seg(p, a, b);
+    const V3 e1 = closest_on_seg(p, b, c);
+    const V3 e2 = closest_on_seg(p, c, a);
+    const float d0 = vdot(sub(p, e0), sub(p, e0));
+    const float d1 = vdot(sub(p, e1), sub(p, e1));
+    const float d2 = vdot(sub(p, e2), sub(p, e2));
+    if (d0 <= d1 && d0 <= d2) {
+        return e0;
+    }
+    return (d1 <= d2) ? e1 : e2;
+}
+// Contact between the blade segment r0r1 and BOUNDED triangle abc. Always fills pen (negative =
+// separation), n and cp when it returns true; false only for degenerate geometry. Handles both
+// proximity (closest pair — edge contacts give naturally rounded ledge-lip normals) and a clean
+// crossing through the interior (pushed back toward the grip side).
+inline bool seg_tri_contact(const V3& r0, const V3& r1, const V3& a, const V3& b, const V3& c,
+                            float blade_radius, float& out_pen, V3& out_n, V3& out_cp) {
+    const V3 tn_raw = vcross(sub(b, a), sub(c, a));
+    const float tn_len = len(tn_raw);
+    if (tn_len < 1e-9f) {
+        return false;
+    }
+    const V3 tn = mul(tn_raw, 1.0f / tn_len);
+    const float sd0 = vdot(sub(r0, a), tn);
+    const float sd1 = vdot(sub(r1, a), tn);
+    if ((sd0 > 0.0f) != (sd1 > 0.0f)) {
+        const float t = sd0 / (sd0 - sd1);
+        const V3 x = add(r0, mul(sub(r1, r0), t));
+        if (point_in_tri(x, a, b, c, tn)) {
+            const float side = sd0 >= 0.0f ? 1.0f : -1.0f;
+            const float deep = side > 0.0f ? -sd1 : sd1; // far endpoint's depth beyond the plane
+            out_n = mul(tn, side);
+            out_pen = blade_radius + (deep > 0.0f ? deep : 0.0f);
+            out_cp = x;
+            return true;
+        }
+    }
+    float best_d2 = 1e18f;
+    V3 best_pb = r0;
+    V3 best_pt = a;
+    const V3 ends[2] = { r0, r1 };
+    for (int i = 0; i < 2; i++) {
+        const V3 pt = closest_on_tri(ends[i], a, b, c, tn);
+        const float d2 = vdot(sub(ends[i], pt), sub(ends[i], pt));
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best_pb = ends[i];
+            best_pt = pt;
+        }
+    }
+    const V3 ea[3] = { a, b, c };
+    const V3 eb[3] = { b, c, a };
+    for (int i = 0; i < 3; i++) {
+        V3 pb, pt;
+        closest_seg_seg(r0, r1, ea[i], eb[i], pb, pt);
+        const float d2 = vdot(sub(pb, pt), sub(pb, pt));
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best_pb = pb;
+            best_pt = pt;
+        }
+    }
+    const float dist = sqrtf(best_d2);
+    if (dist < 1e-5f) {
+        return false;
+    }
+    out_n = mul(sub(best_pb, best_pt), 1.0f / dist);
+    out_pen = blade_radius - dist;
+    out_cp = best_pt;
+    return true;
+}
+
+inline Q4 q4(const float* p) {
+    return { p[0], p[1], p[2], p[3] };
+}
+inline void q4_store(const Q4& q, float* out) {
+    out[0] = q.x;
+    out[1] = q.y;
+    out[2] = q.z;
+    out[3] = q.w;
+}
+inline Q4 qmul(const Q4& a, const Q4& b) {
+    return { a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+             a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+inline Q4 qconj(const Q4& q) {
+    return { -q.x, -q.y, -q.z, q.w };
+}
+inline Q4 qnorm(const Q4& q) {
+    const float m = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    if (m < 1e-8f) {
+        return kQIdent;
+    }
+    return { q.x / m, q.y / m, q.z / m, q.w / m };
+}
+inline V3 qrot(const Q4& q, const V3& v) {
+    // v' = v + 2*qv x (qv x v + w*v)
+    const V3 qv = { q.x, q.y, q.z };
+    const V3 t = { 2.0f * (qv.y * v.z - qv.z * v.y), 2.0f * (qv.z * v.x - qv.x * v.z),
+                   2.0f * (qv.x * v.y - qv.y * v.x) };
+    return { v.x + q.w * t.x + (qv.y * t.z - qv.z * t.y), v.y + q.w * t.y + (qv.z * t.x - qv.x * t.z),
+             v.z + q.w * t.z + (qv.x * t.y - qv.y * t.x) };
+}
+// Rotation error target * q^-1 as a scaled-axis vector (radians), shortest arc.
+inline V3 q_error_vec(const Q4& target, const Q4& q) {
+    Q4 e = qmul(target, qconj(q));
+    if (e.w < 0.0f) { // shortest arc
+        e = { -e.x, -e.y, -e.z, -e.w };
+    }
+    const float sin_half = sqrtf(e.x * e.x + e.y * e.y + e.z * e.z);
+    if (sin_half < 1e-6f) {
+        return kV3Zero;
+    }
+    const float w = e.w > 1.0f ? 1.0f : e.w;
+    const float angle = 2.0f * atan2f(sin_half, w);
+    return mul({ e.x / sin_half, e.y / sin_half, e.z / sin_half }, angle);
+}
+// Integrate orientation by angular velocity (rad/s) over dt: q += 0.5*dt*(0,omega)*q, renormalized.
+#ifdef VRPHYS_TRACE_CORR
+int g_vrphys_trace = 0;
+#endif
+inline Q4 q_integrate(const Q4& q, const V3& omega, float dt) {
+    const Q4 og = { omega.x, omega.y, omega.z, 0.0f };
+    const Q4 dq = qmul(og, q);
+    return qnorm({ q.x + 0.5f * dt * dq.x, q.y + 0.5f * dt * dq.y, q.z + 0.5f * dt * dq.z,
+                   q.w + 0.5f * dt * dq.w });
+}
+
+// --------------------------------------------------------------------------
+// State
+// --------------------------------------------------------------------------
+
+// A hand is reported untracked after this many steps without a fresh sample (~1/4 s at 120 Hz).
+constexpr int kInactiveAfterSteps = 30;
+constexpr int kHistoryCap = 64;
+
+struct HandState {
+    // Pending raw sample for this frame (set by push, consumed by step).
+    bool pending;
+    V3 pend_pos_m;
+    Q4 pend_quat;
+    V3 pend_lin_vel; // runtime-reported, raw tracking space
+    V3 pend_ang_vel;
+    bool pend_vel_valid;
+    uint64_t pend_time_ns;
+
+    // Previous raw sample (for the finite-difference velocity fallback).
+    bool have_prev;
+    V3 prev_pos_m;
+    uint64_t prev_time_ns;
+    V3 fallback_vel; // smoothed finite-difference velocity, raw tracking space
+
+    // Latest converted (game-facing) kinematics.
+    bool have_latest;
+    V3 latest_lin_mps;
+    V3 latest_ang_rps;
+    int steps_since_sample;
+
+    // Unread game-facing history ring, oldest first.
+    VrPhysHandSample ring[kHistoryCap];
+    int ring_head; // index of oldest unread
+    int ring_count;
+};
+
+constexpr int kBladeRingCap = 32;
+constexpr int kEventCap = 16;
+constexpr int kHapticCap = 8;
+constexpr float kBladeRadiusM = 0.012f;    // collision thickness of the held segment
+constexpr float kContactReleaseM = 0.02f;  // hysteresis: clearance required to end a contact
+constexpr float kDeepRecognizeM = 0.35f;   // how far behind a one-sided face still counts as
+                                           // "inside the solid" (capped so far-side polys of
+                                           // thin walls can't push the wrong way)
+constexpr float kCorrectionCapM = 0.15f;
+// Contacts on the hidden side of a face are only trusted this close to the face's boundary
+// edge if the neighbouring face says the blade is genuinely inside the solid. Nearer than
+// this to a convex edge (a ledge lip), a behind-the-plane point usually means the blade is
+// pivoting OVER the edge, and ejecting it through the face is the classic "ghost collision".
+constexpr float kLipGuardM = 0.06f;   // max positional correction per contact per step
+constexpr float kSpeculativeM = 0.05f;     // surfaces within this distance are constrained before
+                                           // being touched, so a resting contact never blinks out
+constexpr float kTouchToleranceM = 0.008f; // counts as "touching" for impact sfx/haptics
+
+struct SlotState {
+    bool active;
+    VrPhysObjectDesc desc;
+    bool state_valid; // pos/quat snapped to the hand at least once since activation
+    // Simulated state, RAW tracking space (meters) — same frame the hand samples arrive in, so a
+    // snap turn (context change) never kicks the spring.
+    V3 pos_m;
+    V3 vel_mps; // finite-difference, for reporting only — never integrated against contacts
+    Q4 quat;
+    V3 ang_vel_rps;
+    // The spring's goal pose. This is driven ONLY by the hand and never sees collision, so it
+    // cannot be destabilized by contacts; the object then moves toward it without penetrating.
+    V3 tgt_pos_m;
+    V3 tgt_vel_mps;
+    Q4 tgt_quat;
+    V3 tgt_ang_vel_rps;
+    // Contact + output state
+    bool in_contact;
+    // Active contacts from the latest solve (RAW space): the spring projects its drive off these
+    // normals next step, and the debug overlay draws them.
+    V3 contact_pts[4];
+    V3 contact_ns[4];
+    float contact_pens[4];
+    int contact_ids[4];
+    int contact_count;
+    VrPhysBladeSample blade_ring[kBladeRingCap];
+    int blade_head;
+    int blade_count;
+};
+
+// Contact primitives: world-space as pushed (game units), converted to raw tracking meters each
+// step with that step's context.
+VrPhysContactPrim g_prims[VRPHYS_MAX_CONTACT_PRIMS];
+int g_prim_count = 0;
+
+VrPhysEvent g_events[kEventCap];
+int g_event_count = 0;
+VrPhysHapticReq g_haptics[kHapticCap];
+int g_haptic_count = 0;
+uint64_t g_last_time_ns = 0; // newest hand-sample time, stamped onto sim outputs
+
+struct Context {
+    bool valid;
+    Q4 turn_rot;
+    V3 turn_off_m;
+    V3 anchor_units;
+    float world_scale;
+    bool first_person;
+};
+
+HandState g_hands[2];
+SlotState g_slots[VRPHYS_SLOT_COUNT];
+Context g_ctx;
+
+// --------------------------------------------------------------------------
+// Flight recorder: a ring of per-sim-step samples for the weapon slot, dumped to CSV on demand.
+// Captures the pose BEFORE and AFTER the contact solve separately, so a jitter cycle can be
+// attributed precisely — spring driving into the surface, contacts over-correcting out, or the
+// contact SET itself churning (the prim hash catches discovery instability at the 20 Hz tick).
+// --------------------------------------------------------------------------
+
+constexpr int kLogCap = 2400; // ~20-27 s of headset-rate capture
+
+struct LogRec {
+    uint64_t t;
+    float dt;
+    float hand[3];      // spring target (raw controller), meters
+    float pos_spring[3];// pose after the spring, before contacts
+    float quat_spring[4];
+    float pos_final[3]; // pose after the contact solve
+    float quat_final[4];
+    float vel[3];
+    float ang[3];
+    float root[3]; // blade endpoints, world units
+    float tip[3];
+    int nc;
+    int nprims;
+    uint32_t prim_hash;
+    struct {
+        float n[3];
+        float p[3];
+        float pen;
+        int id;
+    } c[4];
+};
+
+LogRec* g_log = nullptr;
+int g_log_head = 0;
+int g_log_count = 0;
+bool g_log_enabled = false;
+uint32_t g_prim_hash = 0;
+
+void log_push(const LogRec& r) {
+    if (!g_log_enabled) {
+        return;
+    }
+    if (g_log == nullptr) {
+        g_log = (LogRec*)malloc(sizeof(LogRec) * kLogCap);
+        if (g_log == nullptr) {
+            g_log_enabled = false;
+            return;
+        }
+    }
+    g_log[(g_log_head + g_log_count) % kLogCap] = r;
+    if (g_log_count == kLogCap) {
+        g_log_head = (g_log_head + 1) % kLogCap; // ring: keep the most recent window
+    } else {
+        g_log_count++;
+    }
+}
+
+inline V3 to_world_units(const V3& raw_m, const Context& c) {
+    const V3 turned = add(qrot(c.turn_rot, raw_m), c.turn_off_m);
+    return add(c.anchor_units, mul(turned, c.world_scale));
+}
+
+} // namespace
+
+// --------------------------------------------------------------------------
+// Feeder API
+// --------------------------------------------------------------------------
+
+void vrphys_reset() {
+    memset(g_hands, 0, sizeof(g_hands));
+    memset(g_slots, 0, sizeof(g_slots));
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    g_prim_count = 0;
+    g_event_count = 0;
+    g_haptic_count = 0;
+    g_last_time_ns = 0;
+    for (HandState& h : g_hands) {
+        h.steps_since_sample = kInactiveAfterSteps;
+    }
+}
+
+void vrphys_push_hand_sample(int hand, const float pos_m[3], const float quat_xyzw[4],
+                             const float lin_vel_mps[3], const float ang_vel_rps[3], bool vel_valid,
+                             uint64_t time_ns) {
+    if (hand < 0 || hand > 1) {
+        return;
+    }
+    HandState& h = g_hands[hand];
+    if (time_ns > g_last_time_ns) {
+        g_last_time_ns = time_ns;
+    }
+    h.pending = true;
+    h.pend_pos_m = v3(pos_m);
+    h.pend_quat = q4(quat_xyzw);
+    h.pend_lin_vel = v3(lin_vel_mps);
+    h.pend_ang_vel = v3(ang_vel_rps);
+    h.pend_vel_valid = vel_valid;
+    h.pend_time_ns = time_ns;
+}
+
+void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off_m[3],
+                 const float anchor_units[3], float world_scale, bool first_person) {
+    // Clamp dt into the plausible XR frame window so a hitch (or a runtime reporting a zero
+    // period) can't destabilize the springs.
+    if (dt_s < 1.0f / 144.0f) {
+        dt_s = 1.0f / 144.0f;
+    } else if (dt_s > 1.0f / 45.0f) {
+        dt_s = 1.0f / 45.0f;
+    }
+
+    g_ctx.valid = true;
+    g_ctx.turn_rot = q4(turn_quat_xyzw);
+    g_ctx.turn_off_m = v3(turn_off_m);
+    g_ctx.anchor_units = v3(anchor_units);
+    g_ctx.world_scale = world_scale;
+    g_ctx.first_person = first_person;
+
+    // Convert this frame's pushed samples into game-facing history.
+    for (HandState& h : g_hands) {
+        if (!h.pending) {
+            if (h.steps_since_sample < kInactiveAfterSteps) {
+                h.steps_since_sample++;
+            }
+            continue;
+        }
+        h.pending = false;
+        h.steps_since_sample = 0;
+
+        // Raw-space linear velocity: prefer the runtime's filtered+predicted report; fall back to
+        // finite-differencing consecutive raw samples (lightly smoothed — 120 Hz differences are
+        // noisy) on runtimes that leave XrSpaceVelocity empty.
+        V3 raw_vel;
+        if (h.pend_vel_valid) {
+            raw_vel = h.pend_lin_vel;
+            h.fallback_vel = raw_vel;
+        } else if (h.have_prev && h.pend_time_ns > h.prev_time_ns) {
+            const float sample_dt = (float)((double)(h.pend_time_ns - h.prev_time_ns) * 1e-9);
+            if (sample_dt > 1e-4f && sample_dt < 0.1f) {
+                const V3 inst = mul(sub(h.pend_pos_m, h.prev_pos_m), 1.0f / sample_dt);
+                h.fallback_vel = add(mul(h.fallback_vel, 0.4f), mul(inst, 0.6f));
+            }
+            raw_vel = h.fallback_vel;
+        } else {
+            raw_vel = kV3Zero;
+        }
+        h.have_prev = true;
+        h.prev_pos_m = h.pend_pos_m;
+        h.prev_time_ns = h.pend_time_ns;
+
+        h.have_latest = true;
+        h.latest_lin_mps = qrot(g_ctx.turn_rot, raw_vel);
+        h.latest_ang_rps = qrot(g_ctx.turn_rot, h.pend_ang_vel);
+
+        VrPhysHandSample s;
+        v3_store(to_world_units(h.pend_pos_m, g_ctx), s.pos_units);
+        q4_store(qmul(g_ctx.turn_rot, h.pend_quat), s.quat);
+        v3_store(h.latest_lin_mps, s.lin_vel_mps);
+        v3_store(h.latest_ang_rps, s.ang_vel_rps);
+        s.time_ns = h.pend_time_ns;
+        if (h.ring_count == kHistoryCap) { // full: drop the oldest unread sample
+            h.ring_head = (h.ring_head + 1) % kHistoryCap;
+            h.ring_count--;
+        }
+        h.ring[(h.ring_head + h.ring_count) % kHistoryCap] = s;
+        h.ring_count++;
+    }
+
+    // Convert this tick's contact primitives into raw tracking space with the fresh context
+    // (they are pushed in world space so they stay planted while Link moves within the tick).
+    struct RawPrim {
+        int type;
+        V3 a;
+        V3 b;
+        V3 c;
+        float radius_m;
+        int id;
+    };
+    RawPrim raw_prims[VRPHYS_MAX_CONTACT_PRIMS];
+    const Q4 turn_inv = qconj(g_ctx.turn_rot);
+    const float inv_scale = 1.0f / (g_ctx.world_scale > 1.0f ? g_ctx.world_scale : 35.0f);
+    auto world_to_raw = [&](const V3& w) -> V3 {
+        return qrot(turn_inv, sub(mul(sub(w, g_ctx.anchor_units), inv_scale), g_ctx.turn_off_m));
+    };
+    for (int i = 0; i < g_prim_count; i++) {
+        raw_prims[i].type = g_prims[i].type;
+        raw_prims[i].a = world_to_raw(v3(g_prims[i].a));
+        raw_prims[i].b = (g_prims[i].type == VRPHYS_PRIM_PLANE) ? qrot(turn_inv, v3(g_prims[i].b))
+                                                                : world_to_raw(v3(g_prims[i].b));
+        raw_prims[i].c = (g_prims[i].type == VRPHYS_PRIM_TRI) ? world_to_raw(v3(g_prims[i].c)) : kV3Zero;
+        raw_prims[i].radius_m = g_prims[i].radius * inv_scale;
+        raw_prims[i].id = g_prims[i].id;
+    }
+
+    // Advance the held-object springs toward their hand targets (raw tracking space).
+    constexpr float kTwoPi = 6.28318530717958647692f;
+    constexpr float kMaxAngAccel = 3000.0f; // rad/s^2 — backstop only (implicit = stable)
+    for (SlotState& sl : g_slots) {
+        if (!sl.active) {
+            continue;
+        }
+        const int hand = sl.desc.primary_hand;
+        if (hand < 0 || hand > 1) {
+            continue;
+        }
+        const HandState& h = g_hands[hand];
+        if (!h.have_prev || h.steps_since_sample >= kInactiveAfterSteps) {
+            // Untracked hand: hold pose, bleed velocity so the object doesn't drift away.
+            sl.vel_mps = mul(sl.vel_mps, 0.9f);
+            sl.ang_vel_rps = mul(sl.ang_vel_rps, 0.9f);
+            continue;
+        }
+        const V3 target_pos = h.prev_pos_m; // latest raw sample
+        const Q4 target_quat = h.pend_quat.w == 0.0f && h.pend_quat.x == 0.0f && h.pend_quat.y == 0.0f &&
+                                       h.pend_quat.z == 0.0f
+                                   ? kQIdent
+                                   : h.pend_quat;
+        const V3 target_vel = h.pend_vel_valid ? h.pend_lin_vel : h.fallback_vel;
+
+        if (!sl.state_valid) { // activation: appear in the hand, not fly in from the origin
+            sl.state_valid = true;
+            sl.pos_m = sl.tgt_pos_m = target_pos;
+            sl.vel_mps = sl.tgt_vel_mps = target_vel;
+            sl.quat = sl.tgt_quat = qnorm(target_quat);
+            sl.ang_vel_rps = sl.tgt_ang_vel_rps = kV3Zero;
+            continue;
+        }
+
+        // ------------------------------------------------------------------
+        // POSITION-BASED held-object update.
+        //
+        // Forces and contacts are adversaries: a spring pushes the object into a surface with
+        // force proportional to how far the hand has travelled past it, contacts push back, and
+        // any imbalance between the two is stored as velocity that rings. Pressing harder simply
+        // scales the fight up — which is exactly the "push too hard and it shakes" failure.
+        //
+        // So the spring no longer moves the object. It advances a TARGET pose that is driven by
+        // the hand alone and never sees collision (unconditionally stable by construction). The
+        // object then walks toward that target in small non-penetrating substeps, sliding along
+        // whatever it touches. Nothing accumulates at a contact, so an unreachable target just
+        // means the blade rests against the surface, however hard the hand pushes.
+        // ------------------------------------------------------------------
+
+        // --- Target pose: implicit spring toward the hand (collision-free). ---
+        const float wl = kTwoPi * (sl.desc.lin_freq_hz > 0.1f ? sl.desc.lin_freq_hz : 0.1f);
+        const float k_lin = wl * wl;
+        const float c_lin = 2.0f * sl.desc.lin_zeta * wl;
+        V3 tv = mul(add(add(sl.tgt_vel_mps, mul(sub(target_pos, sl.tgt_pos_m), dt_s * k_lin)),
+                        mul(target_vel, dt_s * c_lin)),
+                    1.0f / (1.0f + dt_s * c_lin + dt_s * dt_s * k_lin));
+        if (sl.desc.max_accel_mps2 > 0.0f) {
+            const V3 dv = sub(tv, sl.tgt_vel_mps);
+            const float dvm = len(dv);
+            const float dvmax = sl.desc.max_accel_mps2 * dt_s;
+            if (dvm > dvmax) {
+                tv = add(sl.tgt_vel_mps, mul(dv, dvmax / dvm));
+            }
+        }
+        sl.tgt_vel_mps = tv;
+        sl.tgt_pos_m = add(sl.tgt_pos_m, mul(sl.tgt_vel_mps, dt_s));
+
+        const float wa = kTwoPi * (sl.desc.ang_freq_hz > 0.1f ? sl.desc.ang_freq_hz : 0.1f);
+        const float k_ang = wa * wa;
+        const float c_ang = 2.0f * sl.desc.ang_zeta * wa;
+        V3 twv = mul(add(add(sl.tgt_ang_vel_rps,
+                             mul(q_error_vec(qnorm(target_quat), sl.tgt_quat), dt_s * k_ang)),
+                         mul(h.pend_ang_vel, dt_s * c_ang)),
+                     1.0f / (1.0f + dt_s * c_ang + dt_s * dt_s * k_ang));
+        const float max_ang = sl.desc.max_ang_accel > 0.0f ? sl.desc.max_ang_accel : kMaxAngAccel;
+        {
+            const V3 dw = sub(twv, sl.tgt_ang_vel_rps);
+            const float dwm = len(dw);
+            const float dwmax = max_ang * dt_s;
+            if (dwm > dwmax) {
+                twv = add(sl.tgt_ang_vel_rps, mul(dw, dwmax / dwm));
+            }
+        }
+        sl.tgt_ang_vel_rps = twv;
+        sl.tgt_quat = q_integrate(sl.tgt_quat, sl.tgt_ang_vel_rps, dt_s);
+
+        // Flight recorder: the pose the spring asked for, before collision has a say.
+        const V3 log_pos_spring = sl.tgt_pos_m;
+        const Q4 log_quat_spring = sl.tgt_quat;
+        const V3 log_hand_target = target_pos;
+
+        const V3 prev_pos = sl.pos_m;
+        const Q4 prev_quat = sl.quat;
+
+        // --- Move the object toward the target without ever penetrating. ---
+        const V3 root_local = v3(sl.desc.grip_local_root_m);
+        const V3 tip_local = v3(sl.desc.grip_local_tip_m);
+        const bool has_segment = len(sub(tip_local, root_local)) > 1e-4f;
+        const float blade_len = len(sub(tip_local, root_local));
+        const float blade_r = sl.desc.blade_radius_m > 0.0f ? sl.desc.blade_radius_m : kBladeRadiusM;
+        const float touch_m =
+            sl.desc.touch_tolerance_m > 0.0f ? sl.desc.touch_tolerance_m : kTouchToleranceM;
+        sl.contact_count = 0;
+
+        float max_impact = 0.0f;
+        int ntouch = 0;
+        V3 ev_n = { 0.0f, 1.0f, 0.0f };
+        V3 ev_p = sl.pos_m;
+        int ev_id = 0;
+
+        if (!sl.desc.contact_enabled || !has_segment || g_prim_count == 0) {
+            sl.pos_m = sl.tgt_pos_m;
+            sl.quat = sl.tgt_quat;
+        } else {
+            // Resolve the blade out of everything it overlaps at its CURRENT pose, moving along
+            // each contact normal. Pure geometry: no impulses, no stored energy, so this can
+            // neither ring nor be fought by the spring. Lever-arm aware, so a tip contact mostly
+            // rotates the blade while the grip keeps tracking the hand.
+            const float inertia = fmaxf(0.02f, blade_len * blade_len / 3.0f);
+            // Triangle adjacency, resolved on the fly against the (small) pushed prim set.
+            // Game collision meshes are sealed, so a face's boundary edge normally has a
+            // neighbouring face sharing both vertices; which side of that neighbour a point
+            // falls on distinguishes "inside the solid" from "hanging past a convex edge".
+            auto same_vert = [](const V3& a, const V3& b) { return len(sub(a, b)) < 1e-3f; };
+            auto find_shared_tri = [&](int self, const V3& e0, const V3& e1) -> int {
+                for (int j = 0; j < g_prim_count; j++) {
+                    if (j == self || raw_prims[j].type != VRPHYS_PRIM_TRI) {
+                        continue;
+                    }
+                    const V3 vv[3] = { raw_prims[j].a, raw_prims[j].b, raw_prims[j].c };
+                    int h0 = -1, h1 = -1;
+                    for (int k = 0; k < 3; k++) {
+                        if (same_vert(vv[k], e0)) h0 = k;
+                        if (same_vert(vv[k], e1)) h1 = k;
+                    }
+                    if (h0 >= 0 && h1 >= 0 && h0 != h1) {
+                        return j;
+                    }
+                }
+                return -1;
+            };
+            // True when a behind-the-plane contact of tri `self` at on-plane point `cpp` is
+            // within the lip guard of a boundary edge AND the probe point (the deep part of
+            // the blade) is on the OUTSIDE of the face sharing that edge: the blade is
+            // wrapping a convex lip, not stabbing the face interior. No neighbour found =>
+            // treat as solid (never open a hole on incomplete adjacency).
+            auto convex_lip_exempt = [&](int self, const V3& cpp, const V3& probe,
+                                         float guard) -> bool {
+                const RawPrim& t = raw_prims[self];
+                const V3 vv[3] = { t.a, t.b, t.c };
+                float best = 1e9f;
+                int be = -1;
+                for (int e = 0; e < 3; e++) {
+                    const V3 q = closest_on_seg(cpp, vv[e], vv[(e + 1) % 3]);
+                    const float d = len(sub(cpp, q));
+                    if (d < best) {
+                        best = d;
+                        be = e;
+                    }
+                }
+                if (be < 0 || best > guard) {
+                    return false;
+                }
+                const int nb = find_shared_tri(self, vv[be], vv[(be + 1) % 3]);
+                if (nb < 0) {
+                    return false;
+                }
+                const RawPrim& q = raw_prims[nb];
+                const V3 qn_raw = vcross(sub(q.b, q.a), sub(q.c, q.a));
+                const float qn_l = len(qn_raw);
+                if (qn_l < 1e-9f) {
+                    return false;
+                }
+                return vdot(sub(probe, q.a), mul(qn_raw, 1.0f / qn_l)) > 1e-4f;
+            };
+            auto depenetrate = [&](int iterations, bool record) {
+                for (int it = 0; it < iterations; it++) {
+                    bool moved = false;
+                    for (int i = 0; i < g_prim_count; i++) {
+                        const RawPrim& pr = raw_prims[i];
+                        V3 tn = { 0.0f, 1.0f, 0.0f };
+                        if (pr.type == VRPHYS_PRIM_TRI) {
+                            const V3 tn_raw = vcross(sub(pr.b, pr.a), sub(pr.c, pr.a));
+                            const float tn_l = len(tn_raw);
+                            if (tn_l < 1e-9f) {
+                                continue;
+                            }
+                            tn = mul(tn_raw, 1.0f / tn_l);
+                        }
+                        constexpr int kSamples = 5;
+                        // m: 0..kSamples-1 point samples, kSamples = interior crossing,
+                        // kSamples+1..kSamples+3 = blade segment vs the tri's three edges
+                        // (the continuous contact that lets the blade rest on and pivot
+                        // around a ledge lip between point samples).
+                        for (int m = 0; m <= kSamples + 3; m++) {
+                            const V3 rootNow = add(sl.pos_m, qrot(sl.quat, root_local));
+                            const V3 tipNow = add(sl.pos_m, qrot(sl.quat, tip_local));
+                            float pen;
+                            V3 n;
+                            V3 cp;
+                            if (m < kSamples) {
+                                const float t = (float)m / (float)(kSamples - 1);
+                                const V3 p = add(rootNow, mul(sub(tipNow, rootNow), t));
+                                if (pr.type == VRPHYS_PRIM_PLANE) {
+                                    const float sd = vdot(sub(p, pr.a), pr.b);
+                                    pen = blade_r - sd;
+                                    n = pr.b;
+                                    cp = sub(p, mul(n, sd));
+                                } else if (pr.type == VRPHYS_PRIM_TRI) {
+                                    const float sd = vdot(sub(p, pr.a), tn);
+                                    if (sd < 0.0f) {
+                                        if (sd < -kDeepRecognizeM) {
+                                            continue;
+                                        }
+                                        const V3 proj = sub(p, mul(tn, sd));
+                                        if (!point_in_tri(proj, pr.a, pr.b, pr.c, tn)) {
+                                            continue;
+                                        }
+                                        if (convex_lip_exempt(i, proj, p, kLipGuardM)) {
+                                            continue;
+                                        }
+                                        pen = blade_r - sd;
+                                        n = tn;
+                                        cp = proj;
+                                    } else {
+                                        const V3 pt = closest_on_tri(p, pr.a, pr.b, pr.c, tn);
+                                        const V3 d = sub(p, pt);
+                                        const float dist = len(d);
+                                        if (dist < 1e-5f) {
+                                            continue;
+                                        }
+                                        pen = blade_r - dist;
+                                        n = mul(d, 1.0f / dist);
+                                        cp = pt;
+                                    }
+                                } else {
+                                    const V3 on_prim = (pr.type == VRPHYS_PRIM_CAPSULE)
+                                                           ? closest_on_seg(p, pr.a, pr.b)
+                                                           : pr.a;
+                                    const V3 d = sub(p, on_prim);
+                                    const float dist = len(d);
+                                    if (dist < 1e-5f) {
+                                        continue;
+                                    }
+                                    pen = (pr.radius_m + blade_r) - dist;
+                                    n = mul(d, 1.0f / dist);
+                                    cp = add(on_prim, mul(n, pr.radius_m));
+                                }
+                            } else if (m == kSamples) {
+                                if (pr.type != VRPHYS_PRIM_TRI) {
+                                    continue;
+                                }
+                                const float sd0 = vdot(sub(rootNow, pr.a), tn);
+                                const float sd1 = vdot(sub(tipNow, pr.a), tn);
+                                if ((sd0 > 0.0f) == (sd1 > 0.0f)) {
+                                    continue;
+                                }
+                                const float t = sd0 / (sd0 - sd1);
+                                const V3 x = add(rootNow, mul(sub(tipNow, rootNow), t));
+                                if (!point_in_tri(x, pr.a, pr.b, pr.c, tn)) {
+                                    continue;
+                                }
+                                const float side = sd0 >= 0.0f ? 1.0f : -1.0f;
+                                const V3 deep_end = (side > 0.0f) ? tipNow : rootNow;
+                                const V3 proj_deep =
+                                    sub(deep_end, mul(tn, vdot(sub(deep_end, pr.a), tn)));
+                                if (!point_in_tri(proj_deep, pr.a, pr.b, pr.c, tn) &&
+                                    convex_lip_exempt(i, proj_deep, deep_end, 1e9f)) {
+                                    continue;
+                                }
+                                const float deep = side > 0.0f ? -sd1 : sd1;
+                                pen = blade_r + (deep > 0.0f ? deep : 0.0f);
+                                n = mul(tn, side);
+                                cp = x;
+                            } else {
+                                if (pr.type != VRPHYS_PRIM_TRI) {
+                                    continue;
+                                }
+                                const int e = m - kSamples - 1;
+                                const V3 vv[3] = { pr.a, pr.b, pr.c };
+                                V3 pb, pt;
+                                closest_seg_seg(rootNow, tipNow, vv[e], vv[(e + 1) % 3], pb, pt);
+                                const V3 d = sub(pb, pt);
+                                const float dist = len(d);
+                                if (dist < 1e-5f) {
+                                    continue;
+                                }
+                                n = mul(d, 1.0f / dist);
+                                // Only outward-facing edge contact: a normal with no component
+                                // along the face normal would drag the blade through the face.
+                                if (vdot(n, tn) < 0.02f) {
+                                    continue;
+                                }
+                                pen = blade_r - dist;
+                                cp = pt;
+                            }
+
+                            if (record && pen > -touch_m) {
+                                ntouch++;
+                                if (pen > -touch_m && sl.contact_count < 4) {
+                                    bool dup = false;
+                                    for (int c = 0; c < sl.contact_count; c++) {
+                                        if (vdot(sl.contact_ns[c], n) > 0.98f) {
+                                            dup = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!dup) {
+                                        sl.contact_pts[sl.contact_count] = cp;
+                                        sl.contact_ns[sl.contact_count] = n;
+                                        sl.contact_pens[sl.contact_count] = pen;
+                                        sl.contact_ids[sl.contact_count] = pr.id;
+                                        sl.contact_count++;
+                                    }
+                                }
+                                ev_n = n;
+                                ev_p = cp;
+                                ev_id = pr.id;
+                            }
+                            if (pen <= 0.0f) {
+                                continue;
+                            }
+                            moved = true;
+#ifdef VRPHYS_TRACE_CORR
+                            if (g_vrphys_trace) {
+                                printf("    CORR prim=%d(id %d) m=%d pen=%.4f n=(%.2f,%.2f,%.2f) cp=(%.3f,%.3f,%.3f)\n",
+                                       i, pr.id, m, pen, n.x, n.y, n.z, cp.x, cp.y, cp.z);
+                            }
+#endif
+
+                            // Positional correction split between translation and rotation by the
+                            // lever arm. Full correction: substeps keep each one tiny.
+                            const V3 r = sub(cp, sl.pos_m);
+                            const V3 rxn = vcross(r, n);
+                            const float k_n = 1.0f + vdot(rxn, rxn) / inertia;
+                            float depth = pen;
+                            if (depth > kCorrectionCapM) {
+                                depth = kCorrectionCapM;
+                            }
+                            const float lambda = depth / k_n;
+                            sl.pos_m = add(sl.pos_m, mul(n, lambda));
+                            V3 dtheta = mul(rxn, lambda / inertia);
+                            const float dtl = len(dtheta);
+                            if (dtl > 0.2f) {
+                                dtheta = mul(dtheta, 0.2f / dtl);
+                            }
+                            sl.quat = q_integrate(sl.quat, dtheta, 1.0f);
+                        }
+                    }
+                    if (!moved) {
+                        break;
+                    }
+                }
+            };
+
+            // Walk toward the target in steps no larger than the blade's own thickness, so the
+            // blade can never jump through a surface and every correction stays shallow.
+            V3 dpos = sub(sl.tgt_pos_m, sl.pos_m);
+            V3 drot = q_error_vec(sl.tgt_quat, sl.quat);
+            const float travel = len(dpos) + len(drot) * blade_len;
+            int nsub = (int)(travel / fmaxf(blade_r, 0.002f)) + 1;
+            if (nsub > 8) {
+                nsub = 8;
+            }
+            const float inv = 1.0f / (float)nsub;
+            const V3 dpos_step = mul(dpos, inv);
+            const V3 drot_step = mul(drot, inv);
+            for (int sIdx = 0; sIdx < nsub; sIdx++) {
+                sl.pos_m = add(sl.pos_m, dpos_step);
+                sl.quat = q_integrate(sl.quat, drot_step, 1.0f);
+                depenetrate(3, sIdx == nsub - 1);
+            }
+        }
+
+        // Velocities are DERIVED, never integrated — nothing to store, nothing to ring.
+        sl.vel_mps = mul(sub(sl.pos_m, prev_pos), 1.0f / dt_s);
+        sl.ang_vel_rps = mul(q_error_vec(sl.quat, prev_quat), 1.0f / dt_s);
+
+        // Impact strength = how much of the motion the surface actually refused this step.
+        {
+            const V3 blocked = sub(sl.tgt_pos_m, sl.pos_m);
+            const float b = len(blocked);
+            if (ntouch > 0 && b > 0.0f) {
+                max_impact = len(sub(mul(sub(sl.pos_m, prev_pos), 1.0f / dt_s),
+                                     mul(sub(sl.tgt_pos_m, prev_pos), 1.0f / dt_s)));
+            }
+        }
+
+        if (ntouch > 0) {
+            if (!sl.in_contact) {
+                sl.in_contact = true;
+                if (g_event_count < kEventCap) {
+                    VrPhysEvent& ev = g_events[g_event_count++];
+                    ev.type = VRPHYS_EV_CONTACT_BEGIN;
+                    ev.slot = static_cast<int>(&sl - &g_slots[0]);
+                    ev.prim_id = ev_id;
+                    v3_store(to_world_units(ev_p, g_ctx), ev.pos_units);
+                    v3_store(qrot(g_ctx.turn_rot, ev_n), ev.normal);
+                    ev.impact_mps = max_impact;
+                    ev.time_ns = g_last_time_ns;
+                }
+                if (g_haptic_count < kHapticCap) {
+                    VrPhysHapticReq& hr = g_haptics[g_haptic_count++];
+                    hr.hand = sl.desc.primary_hand;
+                    hr.amplitude01 = clamp01(0.3f + max_impact * 0.18f);
+                    hr.freq_hz = 0.0f;
+                    hr.duration_ms = 30.0f + (max_impact > 4.0f ? 4.0f : max_impact) * 20.0f;
+                }
+            }
+        } else if (sl.in_contact) {
+            sl.in_contact = false;
+            if (g_event_count < kEventCap) {
+                VrPhysEvent& ev = g_events[g_event_count++];
+                ev.type = VRPHYS_EV_CONTACT_END;
+                ev.slot = static_cast<int>(&sl - &g_slots[0]);
+                ev.prim_id = ev_id;
+                v3_store(to_world_units(ev_p, g_ctx), ev.pos_units);
+                v3_store(qrot(g_ctx.turn_rot, ev_n), ev.normal);
+                ev.impact_mps = 0.0f;
+                ev.time_ns = g_last_time_ns;
+            }
+        }
+
+        // ---- Blade path sample (world units), for the game's swept damage colliders ----
+        if (has_segment) {
+            const V3 root = add(sl.pos_m, qrot(sl.quat, root_local));
+            const V3 tip = add(sl.pos_m, qrot(sl.quat, tip_local));
+            const V3 mid_r = qrot(sl.quat, mul(add(root_local, tip_local), 0.5f));
+            const V3 v_mid = add(sl.vel_mps, vcross(sl.ang_vel_rps, mid_r));
+            if (sl.blade_count == kBladeRingCap) {
+                sl.blade_head = (sl.blade_head + 1) % kBladeRingCap;
+                sl.blade_count--;
+            }
+            VrPhysBladeSample& bs = sl.blade_ring[(sl.blade_head + sl.blade_count) % kBladeRingCap];
+            v3_store(to_world_units(root, g_ctx), bs.root_units);
+            v3_store(to_world_units(tip, g_ctx), bs.tip_units);
+            v3_store(qrot(g_ctx.turn_rot, v_mid), bs.mid_vel_mps);
+            bs.time_ns = g_last_time_ns;
+            sl.blade_count++;
+        }
+
+        // Flight recorder: one sample per step for the weapon slot.
+        if (g_log_enabled && (&sl == &g_slots[VRPHYS_SLOT_WEAPON]) && has_segment) {
+            LogRec r;
+            memset(&r, 0, sizeof(r));
+            r.t = g_last_time_ns;
+            r.dt = dt_s;
+            v3_store(log_hand_target, r.hand);
+            v3_store(log_pos_spring, r.pos_spring);
+            q4_store(log_quat_spring, r.quat_spring);
+            v3_store(sl.pos_m, r.pos_final);
+            q4_store(sl.quat, r.quat_final);
+            v3_store(sl.vel_mps, r.vel);
+            v3_store(sl.ang_vel_rps, r.ang);
+            v3_store(to_world_units(add(sl.pos_m, qrot(sl.quat, root_local)), g_ctx), r.root);
+            v3_store(to_world_units(add(sl.pos_m, qrot(sl.quat, tip_local)), g_ctx), r.tip);
+            r.nc = sl.contact_count;
+            r.nprims = g_prim_count;
+            r.prim_hash = g_prim_hash;
+            for (int ci = 0; ci < sl.contact_count && ci < 4; ci++) {
+                v3_store(sl.contact_ns[ci], r.c[ci].n);
+                v3_store(to_world_units(sl.contact_pts[ci], g_ctx), r.c[ci].p);
+                r.c[ci].pen = sl.contact_pens[ci];
+                r.c[ci].id = sl.contact_ids[ci];
+            }
+            log_push(r);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Game-facing queries
+// --------------------------------------------------------------------------
+
+bool vrphys_get_hand_velocity(int hand, float out_lin_mps[3], float out_ang_rps[3]) {
+    if (out_lin_mps) {
+        out_lin_mps[0] = out_lin_mps[1] = out_lin_mps[2] = 0.0f;
+    }
+    if (out_ang_rps) {
+        out_ang_rps[0] = out_ang_rps[1] = out_ang_rps[2] = 0.0f;
+    }
+    if (hand < 0 || hand > 1) {
+        return false;
+    }
+    const HandState& h = g_hands[hand];
+    if (!h.have_latest || h.steps_since_sample >= kInactiveAfterSteps) {
+        return false;
+    }
+    if (out_lin_mps) {
+        v3_store(h.latest_lin_mps, out_lin_mps);
+    }
+    if (out_ang_rps) {
+        v3_store(h.latest_ang_rps, out_ang_rps);
+    }
+    return true;
+}
+
+int vrphys_get_hand_path(int hand, VrPhysHandSample* out, int max_samples) {
+    if (hand < 0 || hand > 1 || out == nullptr || max_samples <= 0) {
+        return 0;
+    }
+    HandState& h = g_hands[hand];
+    int n = h.ring_count < max_samples ? h.ring_count : max_samples;
+    for (int i = 0; i < n; i++) {
+        out[i] = h.ring[(h.ring_head + i) % kHistoryCap];
+    }
+    h.ring_head = (h.ring_head + n) % kHistoryCap;
+    h.ring_count -= n;
+    return n;
+}
+
+// --------------------------------------------------------------------------
+// Held-object slots
+// --------------------------------------------------------------------------
+
+void vrphys_set_object(int slot, const VrPhysObjectDesc* desc_or_null) {
+    if (slot < 0 || slot >= VRPHYS_SLOT_COUNT) {
+        return;
+    }
+    SlotState& sl = g_slots[slot];
+    if (desc_or_null == nullptr) {
+        sl.active = false;
+        sl.state_valid = false;
+        sl.in_contact = false;
+        sl.blade_head = 0;
+        sl.blade_count = 0;
+        return;
+    }
+    // Re-pushing a descriptor every tick is the expected idiom (soh owns the params); only a
+    // fresh activation resets the simulated state.
+    if (!sl.active) {
+        sl.state_valid = false;
+        sl.in_contact = false;
+        sl.blade_head = 0;
+        sl.blade_count = 0;
+    }
+    sl.active = true;
+    sl.desc = *desc_or_null;
+}
+
+bool vrphys_is_object_active(int slot) {
+    return slot >= 0 && slot < VRPHYS_SLOT_COUNT && g_slots[slot].active;
+}
+
+bool vrphys_get_object_pose(int slot, float out_pos_units[3], float out_quat_xyzw[4], float out_lin_vel_mps[3],
+                            float out_ang_vel_rps[3]) {
+    if (slot < 0 || slot >= VRPHYS_SLOT_COUNT || !g_slots[slot].active || !g_slots[slot].state_valid ||
+        !g_ctx.valid) {
+        if (out_pos_units) {
+            out_pos_units[0] = out_pos_units[1] = out_pos_units[2] = 0.0f;
+        }
+        if (out_quat_xyzw) {
+            out_quat_xyzw[0] = out_quat_xyzw[1] = out_quat_xyzw[2] = 0.0f;
+            out_quat_xyzw[3] = 1.0f;
+        }
+        if (out_lin_vel_mps) {
+            out_lin_vel_mps[0] = out_lin_vel_mps[1] = out_lin_vel_mps[2] = 0.0f;
+        }
+        if (out_ang_vel_rps) {
+            out_ang_vel_rps[0] = out_ang_vel_rps[1] = out_ang_vel_rps[2] = 0.0f;
+        }
+        return false;
+    }
+    const SlotState& sl = g_slots[slot];
+    if (out_pos_units) {
+        v3_store(to_world_units(sl.pos_m, g_ctx), out_pos_units);
+    }
+    if (out_quat_xyzw) {
+        q4_store(qmul(g_ctx.turn_rot, sl.quat), out_quat_xyzw);
+    }
+    if (out_lin_vel_mps) {
+        v3_store(qrot(g_ctx.turn_rot, sl.vel_mps), out_lin_vel_mps);
+    }
+    if (out_ang_vel_rps) {
+        v3_store(qrot(g_ctx.turn_rot, sl.ang_vel_rps), out_ang_vel_rps);
+    }
+    return true;
+}
+
+void vrphys_log_set_enabled(bool enabled) {
+    if (enabled && !g_log_enabled) {
+        g_log_head = 0;
+        g_log_count = 0;
+    }
+    g_log_enabled = enabled;
+}
+
+int vrphys_log_count() {
+    return g_log_count;
+}
+
+int vrphys_log_write(const char* path) {
+    if (g_log == nullptr || g_log_count == 0 || path == nullptr) {
+        return 0;
+    }
+    FILE* f = fopen(path, "w");
+    if (f == nullptr) {
+        return -1;
+    }
+    fprintf(f, "# vr physics capture v1\n");
+    fprintf(f, "# world_scale=%.4f records=%d\n", g_ctx.world_scale, g_log_count);
+    fprintf(f, "# S rows: step,t_ns,dt,handx,handy,handz,sprx,spry,sprz,sqx,sqy,sqz,sqw,"
+               "finx,finy,finz,fqx,fqy,fqz,fqw,vx,vy,vz,wx,wy,wz,"
+               "rootx,rooty,rootz,tipx,tipy,tipz,nc,nprims,primhash\n");
+    fprintf(f, "# C rows: step,idx,nx,ny,nz,pen,id,px,py,pz\n");
+    for (int i = 0; i < g_log_count; i++) {
+        const LogRec& r = g_log[(g_log_head + i) % kLogCap];
+        fprintf(f,
+                "S,%d,%llu,%.6f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,"
+                "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%u\n",
+                i, (unsigned long long)r.t, r.dt, r.hand[0], r.hand[1], r.hand[2], r.pos_spring[0],
+                r.pos_spring[1], r.pos_spring[2], r.quat_spring[0], r.quat_spring[1], r.quat_spring[2],
+                r.quat_spring[3], r.pos_final[0], r.pos_final[1], r.pos_final[2], r.quat_final[0],
+                r.quat_final[1], r.quat_final[2], r.quat_final[3], r.vel[0], r.vel[1], r.vel[2], r.ang[0],
+                r.ang[1], r.ang[2], r.root[0], r.root[1], r.root[2], r.tip[0], r.tip[1], r.tip[2], r.nc,
+                r.nprims, r.prim_hash);
+        for (int c = 0; c < r.nc && c < 4; c++) {
+            fprintf(f, "C,%d,%d,%.5f,%.5f,%.5f,%.6f,%d,%.3f,%.3f,%.3f\n", i, c, r.c[c].n[0], r.c[c].n[1],
+                    r.c[c].n[2], r.c[c].pen, r.c[c].id, r.c[c].p[0], r.c[c].p[1], r.c[c].p[2]);
+        }
+    }
+    fclose(f);
+    const int n = g_log_count;
+    g_log_head = 0;
+    g_log_count = 0;
+    return n;
+}
+
+int vrphys_get_object_contacts(int slot, float* out_pos_units_xyz, float* out_normals_xyz, int max_contacts) {
+    if (slot < 0 || slot >= VRPHYS_SLOT_COUNT || !g_ctx.valid || max_contacts <= 0) {
+        return 0;
+    }
+    const SlotState& sl = g_slots[slot];
+    const int n = sl.contact_count < max_contacts ? sl.contact_count : max_contacts;
+    for (int i = 0; i < n; i++) {
+        v3_store(to_world_units(sl.contact_pts[i], g_ctx), &out_pos_units_xyz[i * 3]);
+        v3_store(qrot(g_ctx.turn_rot, sl.contact_ns[i]), &out_normals_xyz[i * 3]);
+    }
+    return n;
+}
+
+bool vrphys_get_hand_sim_pose_raw(int hand, float out_pos_m[3], float out_quat_xyzw[4]) {
+    for (const SlotState& sl : g_slots) {
+        if (sl.active && sl.state_valid && sl.desc.primary_hand == hand) {
+            v3_store(sl.pos_m, out_pos_m);
+            q4_store(sl.quat, out_quat_xyzw);
+            return true;
+        }
+    }
+    return false;
+}
+
+// --------------------------------------------------------------------------
+// Contact primitives, blade path, events, haptics
+// --------------------------------------------------------------------------
+
+void vrphys_set_contact_prims(const VrPhysContactPrim* prims, int count) {
+    if (prims == nullptr || count <= 0) {
+        g_prim_count = 0;
+        return;
+    }
+    if (count > VRPHYS_MAX_CONTACT_PRIMS) {
+        count = VRPHYS_MAX_CONTACT_PRIMS;
+    }
+    memcpy(g_prims, prims, sizeof(VrPhysContactPrim) * count);
+    g_prim_count = count;
+
+    // Order-independent hash of the pushed set (type + id + vertices, quantized to 1/8 unit).
+    // Static level geometry re-pushed each tick must hash IDENTICALLY; a changing hash while the
+    // player stands still is direct evidence of discovery churn rather than a solver problem.
+    uint32_t h = 0;
+    for (int i = 0; i < count; i++) {
+        uint32_t e = 2166136261u;
+        auto mix = [&e](uint32_t v) {
+            e ^= v;
+            e *= 16777619u;
+        };
+        mix((uint32_t)prims[i].type);
+        mix((uint32_t)prims[i].id);
+        const float* f[3] = { prims[i].a, prims[i].b, prims[i].c };
+        for (int k = 0; k < 3; k++) {
+            for (int j = 0; j < 3; j++) {
+                mix((uint32_t)(int32_t)(f[k][j] * 8.0f));
+            }
+        }
+        h += e; // sum => order independent
+    }
+    g_prim_hash = h;
+}
+
+int vrphys_get_blade_path(int slot, VrPhysBladeSample* out, int max_samples) {
+    if (slot < 0 || slot >= VRPHYS_SLOT_COUNT || out == nullptr || max_samples <= 0) {
+        return 0;
+    }
+    SlotState& sl = g_slots[slot];
+    const int n = sl.blade_count < max_samples ? sl.blade_count : max_samples;
+    for (int i = 0; i < n; i++) {
+        out[i] = sl.blade_ring[(sl.blade_head + i) % kBladeRingCap];
+    }
+    sl.blade_head = (sl.blade_head + n) % kBladeRingCap;
+    sl.blade_count -= n;
+    return n;
+}
+
+int vrphys_drain_events(VrPhysEvent* out, int max_events) {
+    if (out == nullptr || max_events <= 0 || g_event_count == 0) {
+        return 0;
+    }
+    const int n = g_event_count < max_events ? g_event_count : max_events;
+    memcpy(out, g_events, sizeof(VrPhysEvent) * n);
+    if (n < g_event_count) {
+        memmove(g_events, g_events + n, sizeof(VrPhysEvent) * (g_event_count - n));
+    }
+    g_event_count -= n;
+    return n;
+}
+
+int vrphys_take_haptic_requests(VrPhysHapticReq* out, int max) {
+    if (out == nullptr || max <= 0 || g_haptic_count == 0) {
+        return 0;
+    }
+    const int n = g_haptic_count < max ? g_haptic_count : max;
+    memcpy(out, g_haptics, sizeof(VrPhysHapticReq) * n);
+    if (n < g_haptic_count) {
+        memmove(g_haptics, g_haptics + n, sizeof(VrPhysHapticReq) * (g_haptic_count - n));
+    }
+    g_haptic_count -= n;
+    return n;
+}

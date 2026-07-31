@@ -115,6 +115,10 @@ uint16_t vr_get_controller_buttons(int hand);
 void vr_get_thumbstick(int hand, float* x, float* y);
 float vr_get_trigger(int hand);
 float vr_get_grip(int hand);
+// One-shot controller vibration through the OpenXR haptic action. amplitude 0..1, freq_hz <= 0 =
+// runtime default, duration in milliseconds (clamped up to the runtime minimum). Fire-and-forget
+// and not frame-scoped, so game-tick code may call it directly; no-op while input is inactive.
+void vr_trigger_haptic(int hand, float amplitude01, float freq_hz, float duration_ms);
 // Hand draw matrix (model-local -> game-world, engine row-vector MtxF layout) for pinning Link's hand
 // limb to the controller. Includes Link's model scale (set via vr_set_hand_scale). False if untracked.
 bool vr_get_hand_matrix(int hand, float out[4][4]);

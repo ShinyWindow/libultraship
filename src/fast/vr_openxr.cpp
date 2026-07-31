@@ -26,6 +26,7 @@ using Microsoft::WRL::ComPtr;
 #include "fast/Fast3dWindow.h"
 #include "fast/interpreter.h"
 #include "fast/backends/gfx_direct3d_common.h"
+#include "fast/vr_physics.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -184,6 +185,7 @@ static struct {
     XrAction primary_action;           // BOOL: A (right) / X (left)
     XrAction secondary_action;         // BOOL: B (right) / Y (left)
     XrAction menu_action;              // BOOL
+    XrAction haptic_action;            // VIBRATION_OUTPUT (per-hand subaction)
     XrSpace grip_space[2];
     XrSpace aim_space[2];
     bool input_initialized;
@@ -209,6 +211,12 @@ static struct {
     float thumbstick_x[2];
     float thumbstick_y[2];
     uint16_t buttons[2];               // VR_BTN_* bitmask per hand
+    // Hand velocities this frame (RAW tracking space) from XrSpaceVelocity chained into the grip
+    // locate. hand_vel_valid distinguishes "runtime reported them" from "left at zero" so the
+    // physics layer knows when to fall back to finite-differencing.
+    XrVector3f hand_lin_vel[2];
+    XrVector3f hand_ang_vel[2];
+    bool hand_vel_valid[2];
 
     // HUD overlay
     XrSpace view_space;
@@ -435,6 +443,7 @@ static bool setup_input() {
     ok &= make_action("primary", "Primary Button", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.primary_action);
     ok &= make_action("secondary", "Secondary Button", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.secondary_action);
     ok &= make_action("menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.menu_action);
+    ok &= make_action("haptic", "Haptic Feedback", XR_ACTION_TYPE_VIBRATION_OUTPUT, &xr.haptic_action);
     if (!ok) return false;
 
     auto path = [&](const char* s) -> XrPath {
@@ -468,7 +477,9 @@ static bool setup_input() {
               { xr.primary_action, path("/user/hand/right/input/a/click") },
               { xr.secondary_action, path("/user/hand/left/input/y/click") },
               { xr.secondary_action, path("/user/hand/right/input/b/click") },
-              { xr.menu_action, path("/user/hand/left/input/menu/click") } });
+              { xr.menu_action, path("/user/hand/left/input/menu/click") },
+              { xr.haptic_action, path("/user/hand/left/output/haptic") },
+              { xr.haptic_action, path("/user/hand/right/output/haptic") } });
 
     // Valve Index.
     suggest("/interaction_profiles/valve/index_controller",
@@ -487,7 +498,9 @@ static bool setup_input() {
               { xr.primary_action, path("/user/hand/left/input/a/click") },
               { xr.primary_action, path("/user/hand/right/input/a/click") },
               { xr.secondary_action, path("/user/hand/left/input/b/click") },
-              { xr.secondary_action, path("/user/hand/right/input/b/click") } });
+              { xr.secondary_action, path("/user/hand/right/input/b/click") },
+              { xr.haptic_action, path("/user/hand/left/output/haptic") },
+              { xr.haptic_action, path("/user/hand/right/output/haptic") } });
 
     // KHR simple controller — universal fallback (pose + select + menu only).
     suggest("/interaction_profiles/khr/simple_controller",
@@ -498,7 +511,9 @@ static bool setup_input() {
               { xr.primary_action, path("/user/hand/left/input/select/click") },
               { xr.primary_action, path("/user/hand/right/input/select/click") },
               { xr.menu_action, path("/user/hand/left/input/menu/click") },
-              { xr.menu_action, path("/user/hand/right/input/menu/click") } });
+              { xr.menu_action, path("/user/hand/right/input/menu/click") },
+              { xr.haptic_action, path("/user/hand/left/output/haptic") },
+              { xr.haptic_action, path("/user/hand/right/output/haptic") } });
 
     XrSessionActionSetsAttachInfo attach = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
     attach.countActionSets = 1;
@@ -541,7 +556,12 @@ static void update_input() {
     for (int h = 0; h < 2; h++) {
         const XrPath hp = xr.hand_path[h];
 
+        // Chain a velocity request into the grip locate: the runtime returns filtered + predicted
+        // hand velocities for free — far cleaner than differentiating poses ourselves. Consumed by
+        // the physical-combat layer (vr_physics) for swing speed and throw velocity.
+        XrSpaceVelocity vel = { XR_TYPE_SPACE_VELOCITY };
         XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
+        loc.next = &vel;
         xrLocateSpace(xr.grip_space[h], xr.local_space, t, &loc);
         const bool valid = (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
                            (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
@@ -549,6 +569,11 @@ static void update_input() {
         if (valid) {
             xr.grip_pose[h] = loc.pose;
         }
+        xr.hand_vel_valid[h] = valid && (vel.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT);
+        xr.hand_lin_vel[h] = xr.hand_vel_valid[h] ? vel.linearVelocity : XrVector3f{ 0.0f, 0.0f, 0.0f };
+        xr.hand_ang_vel[h] = (valid && (vel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT))
+                                 ? vel.angularVelocity
+                                 : XrVector3f{ 0.0f, 0.0f, 0.0f };
 
         XrSpaceLocation aloc = { XR_TYPE_SPACE_LOCATION };
         xrLocateSpace(xr.aim_space[h], xr.local_space, t, &aloc);
@@ -1117,6 +1142,7 @@ bool vr_init() {
 void vr_shutdown() {
     xr.initialized = false;
     xr.session_running = false;
+    vrphys_reset();
 
     for (uint32_t eye = 0; eye < 2; eye++) {
         auto& sc = xr.eye_swapchains[eye];
@@ -1410,6 +1436,42 @@ bool vr_begin_frame() {
             xr.grip_pose_raw[h] = xr.grip_pose[h];
             xr.grip_pose[h] = apply_turn(xr.grip_pose[h]);
             xr.aim_pose[h] = apply_turn(xr.aim_pose[h]);
+        }
+    }
+
+    // Physical-combat substrate: push this frame's RAW hand kinematics, then integrate one step
+    // with the frame's world context (snap turn + the same blended anchor vr_get_hand_pose uses,
+    // current because vr_set_interp_alpha runs just before vr_begin_frame). Raw in, context
+    // alongside: hand history stays continuous across snap turns instead of spiking.
+    {
+        for (int h = 0; h < 2; h++) {
+            if (!xr.hand_active[h]) {
+                continue;
+            }
+            const XrPosef& rp = xr.grip_pose_raw[h];
+            const float pos[3] = { rp.position.x, rp.position.y, rp.position.z };
+            const float quat[4] = { rp.orientation.x, rp.orientation.y, rp.orientation.z, rp.orientation.w };
+            const float lv[3] = { xr.hand_lin_vel[h].x, xr.hand_lin_vel[h].y, xr.hand_lin_vel[h].z };
+            const float av[3] = { xr.hand_ang_vel[h].x, xr.hand_ang_vel[h].y, xr.hand_ang_vel[h].z };
+            vrphys_push_hand_sample(h, pos, quat, lv, av, xr.hand_vel_valid[h],
+                                    (uint64_t)xr.frame_state.predictedDisplayTime);
+        }
+        const float dt = xr.frame_state.predictedDisplayPeriod > 0
+                             ? (float)((double)xr.frame_state.predictedDisplayPeriod * 1e-9)
+                             : 1.0f / (float)vr_get_refresh_rate();
+        const float turn_quat[4] = { g_turn_rot.x, g_turn_rot.y, g_turn_rot.z, g_turn_rot.w };
+        const float turn_off[3] = { g_turn_off.x, g_turn_off.y, g_turn_off.z };
+        const glm::vec3 anchor = (xr.first_person && xr.anchor_initialized)
+                                     ? glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha)
+                                     : glm::vec3(0.0f);
+        const float anchor_units[3] = { anchor.x, anchor.y, anchor.z };
+        vrphys_step(dt, turn_quat, turn_off, anchor_units, xr.world_scale, xr.first_person);
+
+        // Fire the contact haptics the sim just produced — same frame, zero game-tick latency.
+        VrPhysHapticReq reqs[8];
+        const int nreq = vrphys_take_haptic_requests(reqs, 8);
+        for (int i = 0; i < nreq; i++) {
+            vr_trigger_haptic(reqs[i].hand, reqs[i].amplitude01, reqs[i].freq_hz, reqs[i].duration_ms);
         }
     }
 
@@ -1869,6 +1931,8 @@ void vr_apply_mode_request() {
         xr.enabled = false;
         // The overlay DL pointer goes stale immediately (graph.c stops re-arming it in flat mode).
         xr.hud_commands = nullptr;
+        // Stale hand kinematics/sim state must not leak across a disable -> re-enable gap.
+        vrphys_reset();
     } else if (!xr.enabled) {
         // Session alive but idle: keep pumping the event loop at tick rate so the runtime sees us
         // as responsive AND so the "headset donned" presence event can arrive to resume VR.
@@ -1973,6 +2037,23 @@ void vr_set_interp_alpha(float alpha) {
 // uses). The game pushes the combined anchor (bodyHead - roomscale_origin) via vr_set_camera_anchor,
 // so hands are automatically consistent with the eye + roomscale. out_quat is x,y,z,w. Returns false
 // (and identity) if the hand isn't tracked.
+// Effective grip pose for game-facing consumers: normally the (snap-turn-adjusted) controller
+// grip, but while the held-object sim owns this hand, the SIMULATED grip pose instead — that is
+// what makes the rendered hand/weapon (and every collider the game derives from the hand matrix)
+// press against surfaces and lag with inertia. Sim state is raw tracking space, so the artificial
+// turn is applied here exactly like everything else game-facing.
+static XrPosef vr_effective_grip_pose(int hand) {
+    float sp[3];
+    float sq[4];
+    if (vrphys_get_hand_sim_pose_raw(hand, sp, sq)) {
+        XrPosef p;
+        p.position = { sp[0], sp[1], sp[2] };
+        p.orientation = { sq[0], sq[1], sq[2], sq[3] };
+        return apply_turn(p);
+    }
+    return xr.grip_pose[hand];
+}
+
 bool vr_get_hand_pose(int hand, float out_pos[3], float out_quat[4]) {
     if (hand < 0 || hand > 1 || !xr.initialized || !xr.input_initialized || !xr.hand_active[hand]) {
         out_pos[0] = out_pos[1] = out_pos[2] = 0.0f;
@@ -1980,7 +2061,7 @@ bool vr_get_hand_pose(int hand, float out_pos[3], float out_quat[4]) {
         out_quat[3] = 1.0f;
         return false;
     }
-    const XrPosef& p = xr.grip_pose[hand];
+    const XrPosef p = vr_effective_grip_pose(hand);
     const glm::vec3 anchor = (xr.first_person && xr.anchor_initialized)
                                  ? glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha)
                                  : glm::vec3(0.0f);
@@ -2067,6 +2148,23 @@ float vr_get_grip(int hand) {
     return xr.squeeze_value[hand];
 }
 
+// One-shot controller vibration through the haptic output action. xrApplyHapticFeedback is not
+// frame-scoped and the whole pipeline is single-threaded, so game-tick code calls this directly —
+// no queue needed. While the session isn't focused the runtime just ignores it.
+void vr_trigger_haptic(int hand, float amplitude01, float freq_hz, float duration_ms) {
+    if (hand < 0 || hand > 1 || !xr.initialized || !xr.enabled || !xr.input_initialized) {
+        return;
+    }
+    XrHapticActionInfo info = { XR_TYPE_HAPTIC_ACTION_INFO };
+    info.action = xr.haptic_action;
+    info.subactionPath = xr.hand_path[hand];
+    XrHapticVibration vib = { XR_TYPE_HAPTIC_VIBRATION };
+    vib.amplitude = fminf(fmaxf(amplitude01, 0.0f), 1.0f);
+    vib.frequency = freq_hz > 0.0f ? freq_hz : XR_FREQUENCY_UNSPECIFIED;
+    vib.duration = duration_ms > 0.0f ? (XrDuration)((double)duration_ms * 1.0e6) : XR_MIN_HAPTIC_DURATION;
+    xrApplyHapticFeedback(xr.session, &info, reinterpret_cast<const XrHapticBaseHeader*>(&vib));
+}
+
 // Live hand-matrix registry: maps each frame's hand limb Mtx* to its controller index so gfx_pc can
 // substitute a fresh controller pose per eye, bypassing the game-rate interpolation that makes the
 // hands judder (the camera is smooth for the same reason — it's replaced live per eye). g_hand_scale
@@ -2090,7 +2188,7 @@ bool vr_get_hand_matrix(int hand, float out[4][4]) {
     if (hand < 0 || hand > 1 || !xr.initialized || !xr.input_initialized || !xr.hand_active[hand]) {
         return false;
     }
-    const XrPosef& p = xr.grip_pose[hand];
+    const XrPosef p = vr_effective_grip_pose(hand);
     const glm::vec3 anchor = (xr.first_person && xr.anchor_initialized)
                                  ? glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha)
                                  : glm::vec3(0.0f);
@@ -2489,6 +2587,7 @@ bool vr_get_hand_matrix(int, float out[4][4]) {
 }
 void vr_set_hand_scale(float) {}
 void vr_set_hand_mirror(int, bool) {}
+void vr_trigger_haptic(int, float, float, float) {}
 void vr_register_hand_matrix(const void*, int) {}
 void vr_clear_hand_matrices() {}
 bool vr_lookup_hand_matrix(const void*, float out[4][4]) {

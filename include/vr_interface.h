@@ -102,6 +102,130 @@ float    VR_GetGrip(int hand);
 // controller. Includes Link's model scale (set via VR_SetHandScale). False if untracked.
 bool     VR_GetHandMatrix(int hand, float out[4][4]);
 
+// --- Physical combat substrate ---
+// Contract version of the physical-combat interface between the game and this library. Bump on any
+// breaking change to these types/functions; the game asserts equality at init so a stale submodule
+// build fails loudly instead of subtly misbehaving.
+#define VR_PHYS_INTERFACE_VERSION 6
+int32_t VR_PhysGetInterfaceVersion(void);
+
+// Latest hand velocity: linear in physical meters/second (independent of world scale and Link's
+// age — tune gameplay thresholds in real m/s), angular in radians/second, directions in the same
+// game-facing frame as VR_GetHandPose (snap turn applied). Runtime-reported (filtered + predicted)
+// where supported, else finite-differenced from the pose history. False while the hand is untracked.
+bool VR_GetHandVelocity(int hand, float linVelMps[3], float angVelRps[3]);
+
+// Headset-rate hand pose history: one sample per XR frame, oldest first, drained — each sample is
+// returned exactly once. pos is in game-world units with the camera anchor at SAMPLE time folded in
+// (same composition as VR_GetHandPose); velocity in physical m/s. Call once per game tick with
+// maxSamples >= 16 (a 20 Hz tick spans ~6 XR frames at 120 Hz; 16 leaves slack for hitches).
+typedef struct VrHandSample {
+    float pos[3];       // game-world units
+    float quat[4];      // x,y,z,w, game-facing frame
+    float linVelMps[3]; // physical m/s, game-facing direction (runtime-filtered; free of
+                        // artificial locomotion, snap turns and camera-anchor motion)
+    float angVelRps[3]; // angular velocity, rad/s, game-facing frame (same filtering) — combine
+                        // as v + w x r for the velocity of any point on a held object
+    uint64_t timeNs;    // XR predicted display time
+} VrHandSample;
+int32_t VR_GetHandPath(int hand, VrHandSample* out, int32_t maxSamples);
+
+// One-shot controller vibration. amplitude 0..1, freqHz <= 0 = runtime default, duration in
+// milliseconds (clamped up to the runtime minimum). Safe to call any time; no-op when VR is off.
+void VR_TriggerHaptic(int hand, float amplitude01, float freqHz, float durationMs);
+
+// Live world scale in game units per real-world meter (includes auto height calibration), for
+// converting between the physical-combat APIs' meter-based values and world units.
+float VR_GetWorldScale(void);
+
+// --- Held-object simulation (spring-damper "virtual held object" with contact) ---
+// One slot per concurrently-simulated held thing. Push a descriptor every game tick while held
+// (soh owns all tuning); pass NULL to release the slot. While a slot owns a hand, the rendered
+// hand — and everything the game derives from the hand matrix, colliders included — follows the
+// SIMULATED pose: the object lags with inertia and stops/bounces on the pushed contact
+// primitives while the real hand keeps going.
+
+#define VR_PHYS_SLOT_WEAPON 0
+#define VR_PHYS_SLOT_SHIELD 1
+#define VR_PHYS_SLOT_PROP 2
+#define VR_PHYS_SLOT_BOW 3
+
+typedef struct VrHeldObjectDesc {
+    int primaryHand;         // VR_HAND_LEFT / VR_HAND_RIGHT
+    int secondaryHand;       // -1 = one-handed
+    float linFreqHz;         // position spring frequency (14+ = near-1:1, 3-4 = heavy)
+    float linZeta;           // position damping ratio (>= 1 = no overshoot)
+    float angFreqHz;         // orientation spring frequency
+    float angZeta;           // orientation damping ratio
+    float maxAccelMps2;      // linear acceleration clamp; <= 0 = unclamped
+    float gripLocalRootM[3]; // held segment (handle end -> business end), grip-local meters
+    float gripLocalTipM[3];
+    int contactEnabled;      // nonzero: resolve the segment against the contact primitives
+    float restitution;       // contact bounce (0 = dead stop, 1 = full reflect)
+    float friction;          // tangential damping while contacting (0..1)
+    // Contact tuning; <= 0 means "use the library default".
+    float bladeRadiusM;     // collision thickness: how far the object rests off a surface
+    float speculativeM;     // constrain surfaces within this distance BEFORE touching them
+    float touchToleranceM;  // counts as touching, for impact effects
+    float maxAngAccel;      // angular acceleration ceiling, rad/s^2 (stability backstop)
+} VrHeldObjectDesc;
+void VR_PhysSetObject(int slot, const VrHeldObjectDesc* descOrNull);
+
+// Contact primitives, world space / game units, re-pushed each game tick: level geometry planes
+// and the colliders a blade must not pass through (armor, shields). Max 24; excess dropped.
+#define VR_PHYS_PRIM_SPHERE 0  // a = center, radius
+#define VR_PHYS_PRIM_CAPSULE 1 // a..b segment, radius
+#define VR_PHYS_PRIM_PLANE 2   // a = point on plane, b = unit normal
+#define VR_PHYS_PRIM_TRI 3     // a,b,c = triangle vertices (BOUNDED — use for level geometry so
+                               //   constraints end exactly where the polygon ends: ledges, corners)
+#define VR_PHYS_MAX_CONTACT_PRIMS 24
+typedef struct VrContactPrim {
+    int type;
+    float a[3];
+    float b[3];
+    float c[3];
+    float radius;
+    int32_t id; // opaque game-side tag (e.g. kind + surface material), echoed back in events
+} VrContactPrim;
+void VR_PhysSetContactPrims(const VrContactPrim* prims, int32_t count);
+
+// The simulated blade's path, one sample per XR frame (world units), oldest first, drained —
+// build swept damage colliders from THIS (not the raw hand path) while the sim owns the weapon,
+// or a blade stopped at a wall would still deal damage along the hand's ghost trajectory.
+typedef struct VrBladeSample {
+    float root[3];      // world units
+    float tip[3];       // world units
+    float midVelMps[3]; // sim velocity of the blade midpoint, m/s (locomotion-free)
+    uint64_t timeNs;
+} VrBladeSample;
+int32_t VR_PhysGetBladePath(int slot, VrBladeSample* out, int32_t maxSamples);
+
+// Contact events (begin/end), oldest first, drained once per game tick — drive impact SFX and
+// spark effects from these. The matching haptics fire VR-side with zero tick latency.
+#define VR_PHYS_EV_CONTACT_BEGIN 0
+#define VR_PHYS_EV_CONTACT_END 1
+typedef struct VrContactEvent {
+    int type;
+    int slot;
+    int32_t primId;  // the contacted primitive's id tag (what the blade actually touched)
+    float pos[3];    // contact point, world units
+    float normal[3]; // contact normal, game-facing frame
+    float impactMps; // approach speed at contact begin
+    uint64_t timeNs;
+} VrContactEvent;
+int32_t VR_PhysDrainEvents(VrContactEvent* out, int32_t maxEvents);
+
+// Debug: the blade's active contacts from the latest sim step (up to 4). outPosXYZ/outNormalXYZ
+// receive 3 floats per contact (world units / game-facing unit normals). Returns the count.
+int32_t VR_PhysGetContacts(int slot, float* outPosXYZ, float* outNormalXYZ, int32_t maxContacts);
+
+// Flight recorder for diagnosing held-object behavior. While enabled every sim step is captured
+// (ring buffer, most recent ~20 s). Write dumps CSV and empties the ring; it returns the record
+// count, or -1 if the file could not be opened.
+void VR_PhysLogSetEnabled(bool enabled);
+int32_t VR_PhysLogCount(void);
+int32_t VR_PhysLogWrite(const char* path);
+
 // Live hand rendering. Set the model scale (Link's actor.scale) each frame; clear the hand-matrix
 // registry each frame, then tag each hand limb's Mtx* so gfx_pc replaces it with the live controller
 // pose per eye (full headset rate, no game-rate judder).

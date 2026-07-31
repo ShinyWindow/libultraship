@@ -1,7 +1,9 @@
 ﻿#include "vr_interface.h"
 #include "fast/vr_openxr.h"
+#include "fast/vr_physics.h"
 
 #include <chrono>
+#include <string.h>
 
 namespace {
 std::chrono::steady_clock::time_point g_game_tick_start;
@@ -136,6 +138,168 @@ float VR_GetGrip(int hand) {
 
 bool VR_GetHandMatrix(int hand, float out[4][4]) {
     return vr_get_hand_matrix(hand, out);
+}
+
+int32_t VR_PhysGetInterfaceVersion(void) {
+    // Compiled into the library: the game compares this against ITS copy of the header's
+    // VR_PHYS_INTERFACE_VERSION, so a stale submodule build is caught at init.
+    return VR_PHYS_INTERFACE_VERSION;
+}
+
+bool VR_GetHandVelocity(int hand, float linVelMps[3], float angVelRps[3]) {
+    return vrphys_get_hand_velocity(hand, linVelMps, angVelRps);
+}
+
+int32_t VR_GetHandPath(int hand, VrHandSample* out, int32_t maxSamples) {
+    if (out == nullptr || maxSamples <= 0) {
+        return 0;
+    }
+    // VrHandSample (C ABI) and VrPhysHandSample (internal) are field-for-field identical; copy
+    // explicitly rather than aliasing so the two headers can evolve with a compile error, not UB.
+    static_assert(sizeof(VrHandSample) == sizeof(VrPhysHandSample), "hand sample structs must match");
+    VrPhysHandSample tmp[16];
+    int32_t total = 0;
+    while (total < maxSamples) {
+        int want = maxSamples - total;
+        if (want > 16) {
+            want = 16;
+        }
+        const int got = vrphys_get_hand_path(hand, tmp, want);
+        for (int i = 0; i < got; i++) {
+            memcpy(out[total + i].pos, tmp[i].pos_units, sizeof(float) * 3);
+            memcpy(out[total + i].quat, tmp[i].quat, sizeof(float) * 4);
+            memcpy(out[total + i].linVelMps, tmp[i].lin_vel_mps, sizeof(float) * 3);
+            memcpy(out[total + i].angVelRps, tmp[i].ang_vel_rps, sizeof(float) * 3);
+            out[total + i].timeNs = tmp[i].time_ns;
+        }
+        total += got;
+        if (got < want) {
+            break;
+        }
+    }
+    return total;
+}
+
+void VR_TriggerHaptic(int hand, float amplitude01, float freqHz, float durationMs) {
+    vr_trigger_haptic(hand, amplitude01, freqHz, durationMs);
+}
+
+float VR_GetWorldScale(void) {
+    return vr_get_world_scale();
+}
+
+void VR_PhysSetObject(int slot, const VrHeldObjectDesc* descOrNull) {
+    if (descOrNull == nullptr) {
+        vrphys_set_object(slot, nullptr);
+        return;
+    }
+    const VrHeldObjectDesc& d = *descOrNull;
+    VrPhysObjectDesc tmp;
+    tmp.primary_hand = d.primaryHand;
+    tmp.secondary_hand = d.secondaryHand;
+    tmp.lin_freq_hz = d.linFreqHz;
+    tmp.lin_zeta = d.linZeta;
+    tmp.ang_freq_hz = d.angFreqHz;
+    tmp.ang_zeta = d.angZeta;
+    tmp.max_accel_mps2 = d.maxAccelMps2;
+    memcpy(tmp.grip_local_root_m, d.gripLocalRootM, sizeof(float) * 3);
+    memcpy(tmp.grip_local_tip_m, d.gripLocalTipM, sizeof(float) * 3);
+    tmp.contact_enabled = d.contactEnabled != 0;
+    tmp.restitution = d.restitution;
+    tmp.friction = d.friction;
+    tmp.blade_radius_m = d.bladeRadiusM;
+    tmp.speculative_m = d.speculativeM;
+    tmp.touch_tolerance_m = d.touchToleranceM;
+    tmp.max_ang_accel = d.maxAngAccel;
+    vrphys_set_object(slot, &tmp);
+}
+
+void VR_PhysSetContactPrims(const VrContactPrim* prims, int32_t count) {
+    VrPhysContactPrim tmp[VRPHYS_MAX_CONTACT_PRIMS];
+    int n = 0;
+    if (prims != nullptr && count > 0) {
+        n = count < VRPHYS_MAX_CONTACT_PRIMS ? count : VRPHYS_MAX_CONTACT_PRIMS;
+        for (int i = 0; i < n; i++) {
+            tmp[i].type = prims[i].type;
+            memcpy(tmp[i].a, prims[i].a, sizeof(float) * 3);
+            memcpy(tmp[i].b, prims[i].b, sizeof(float) * 3);
+            memcpy(tmp[i].c, prims[i].c, sizeof(float) * 3);
+            tmp[i].radius = prims[i].radius;
+            tmp[i].id = prims[i].id;
+        }
+    }
+    vrphys_set_contact_prims(n > 0 ? tmp : nullptr, n);
+}
+
+int32_t VR_PhysGetBladePath(int slot, VrBladeSample* out, int32_t maxSamples) {
+    if (out == nullptr || maxSamples <= 0) {
+        return 0;
+    }
+    VrPhysBladeSample tmp[16];
+    int32_t total = 0;
+    while (total < maxSamples) {
+        int want = maxSamples - total;
+        if (want > 16) {
+            want = 16;
+        }
+        const int got = vrphys_get_blade_path(slot, tmp, want);
+        for (int i = 0; i < got; i++) {
+            memcpy(out[total + i].root, tmp[i].root_units, sizeof(float) * 3);
+            memcpy(out[total + i].tip, tmp[i].tip_units, sizeof(float) * 3);
+            memcpy(out[total + i].midVelMps, tmp[i].mid_vel_mps, sizeof(float) * 3);
+            out[total + i].timeNs = tmp[i].time_ns;
+        }
+        total += got;
+        if (got < want) {
+            break;
+        }
+    }
+    return total;
+}
+
+int32_t VR_PhysGetContacts(int slot, float* outPosXYZ, float* outNormalXYZ, int32_t maxContacts) {
+    return vrphys_get_object_contacts(slot, outPosXYZ, outNormalXYZ, maxContacts);
+}
+
+void VR_PhysLogSetEnabled(bool enabled) {
+    vrphys_log_set_enabled(enabled);
+}
+
+int32_t VR_PhysLogCount(void) {
+    return vrphys_log_count();
+}
+
+int32_t VR_PhysLogWrite(const char* path) {
+    return vrphys_log_write(path);
+}
+
+int32_t VR_PhysDrainEvents(VrContactEvent* out, int32_t maxEvents) {
+    if (out == nullptr || maxEvents <= 0) {
+        return 0;
+    }
+    VrPhysEvent tmp[8];
+    int32_t total = 0;
+    while (total < maxEvents) {
+        int want = maxEvents - total;
+        if (want > 8) {
+            want = 8;
+        }
+        const int got = vrphys_drain_events(tmp, want);
+        for (int i = 0; i < got; i++) {
+            out[total + i].type = tmp[i].type;
+            out[total + i].slot = tmp[i].slot;
+            out[total + i].primId = tmp[i].prim_id;
+            memcpy(out[total + i].pos, tmp[i].pos_units, sizeof(float) * 3);
+            memcpy(out[total + i].normal, tmp[i].normal, sizeof(float) * 3);
+            out[total + i].impactMps = tmp[i].impact_mps;
+            out[total + i].timeNs = tmp[i].time_ns;
+        }
+        total += got;
+        if (got < want) {
+            break;
+        }
+    }
+    return total;
 }
 
 void VR_SetHandScale(float s) {
