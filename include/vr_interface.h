@@ -106,7 +106,7 @@ bool     VR_GetHandMatrix(int hand, float out[4][4]);
 // Contract version of the physical-combat interface between the game and this library. Bump on any
 // breaking change to these types/functions; the game asserts equality at init so a stale submodule
 // build fails loudly instead of subtly misbehaving.
-#define VR_PHYS_INTERFACE_VERSION 11
+#define VR_PHYS_INTERFACE_VERSION 12
 int32_t VR_PhysGetInterfaceVersion(void);
 
 // Latest hand velocity: linear in physical meters/second (independent of world scale and Link's
@@ -161,11 +161,9 @@ typedef struct VrHeldObjectDesc {
     float gripLocalRootM[3]; // held segment (handle end -> business end), grip-local meters
     float gripLocalTipM[3];
     int contactEnabled;      // nonzero: resolve the segment against the contact primitives
-    float restitution;       // contact bounce (0 = dead stop, 1 = full reflect)
     float friction;          // tangential damping while contacting (0..1)
     // Contact tuning; <= 0 means "use the library default".
     float bladeRadiusM;     // collision thickness: how far the object rests off a surface
-    float speculativeM;     // constrain surfaces within this distance BEFORE touching them
     float touchToleranceM;  // counts as touching, for impact effects
     float maxAngAccel;      // angular acceleration ceiling, rad/s^2 (stability backstop)
     int32_t pivotOnly;      // nonzero: contacts may only ROTATE the object about the grip —

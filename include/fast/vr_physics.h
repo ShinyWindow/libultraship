@@ -87,11 +87,9 @@ struct VrPhysObjectDesc {
     float grip_local_root_m[3]; // held segment (handle end -> business end) in grip-local meters;
     float grip_local_tip_m[3];  //   this is what the contact solve sweeps
     bool contact_enabled;       // resolve the segment against the pushed contact primitives
-    float restitution;          // contact bounce (0 = dead stop, 1 = full reflect)
     float friction;             // tangential damping per contacting step (0..1)
     // Tuning; <= 0 means "use the built-in default".
     float blade_radius_m;    // collision thickness — how far the segment rests from a surface
-    float speculative_m;     // constrain surfaces within this distance (before touching)
     float touch_tolerance_m; // treat as touching (impact sfx/haptics) within this distance
     float max_ang_accel;     // angular acceleration clamp, rad/s^2
     bool pivot_only;         // contacts rotate the object about the grip, never translate it

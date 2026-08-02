@@ -275,18 +275,15 @@ constexpr int kBladeRingCap = 32;
 constexpr int kEventCap = 16;
 constexpr int kHapticCap = 8;
 constexpr float kBladeRadiusM = 0.012f;    // collision thickness of the held segment
-constexpr float kContactReleaseM = 0.02f;  // hysteresis: clearance required to end a contact
 constexpr float kDeepRecognizeM = 0.35f;   // how far behind a one-sided face still counts as
                                            // "inside the solid" (capped so far-side polys of
                                            // thin walls can't push the wrong way)
-constexpr float kCorrectionCapM = 0.15f;
+constexpr float kCorrectionCapM = 0.15f;   // max positional correction per contact per step
 // Contacts on the hidden side of a face are only trusted this close to the face's boundary
 // edge if the neighbouring face says the blade is genuinely inside the solid. Nearer than
 // this to a convex edge (a ledge lip), a behind-the-plane point usually means the blade is
 // pivoting OVER the edge, and ejecting it through the face is the classic "ghost collision".
-constexpr float kLipGuardM = 0.06f;   // max positional correction per contact per step
-constexpr float kSpeculativeM = 0.05f;     // surfaces within this distance are constrained before
-                                           // being touched, so a resting contact never blinks out
+constexpr float kLipGuardM = 0.06f;
 constexpr float kTouchToleranceM = 0.008f; // counts as "touching" for impact sfx/haptics
 
 struct SlotState {
@@ -550,8 +547,12 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         return qrot(turn_inv, sub(mul(sub(w, g_ctx.anchor_units), inv_scale), g_ctx.turn_off_m));
     };
     auto raw_to_world = [&](const V3& p) -> V3 {
+        // Must mirror to_world_units exactly: the turn offset applies AFTER the turn rotation.
+        // Rotating (p + off) instead displaces the result by R*off - off, which is nonzero the
+        // moment any snap turn has accumulated — and this position ranks the visual-mesh tris,
+        // so the error selected constraints around a phantom blade.
         return add(g_ctx.anchor_units,
-                   mul(qrot(g_ctx.turn_rot, add(p, g_ctx.turn_off_m)), 1.0f / inv_scale));
+                   mul(add(qrot(g_ctx.turn_rot, p), g_ctx.turn_off_m), 1.0f / inv_scale));
     };
     for (int i = 0; i < g_prim_count; i++) {
         raw_prims[i].type = g_prims[i].type;
@@ -592,7 +593,12 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                     mul(add(add(g_mesh_dbg[p].a, g_mesh_dbg[p].b), g_mesh_dbg[p].c), 1.0f / 3.0f);
             }
             const float sticky_bias = 8.0f; // world units of rank preference
-            Sel sel[kMeshSelect];
+            // Both eyes render (and harvest) the same geometry, so every unique tri appears
+            // TWICE in the buffer. Rank 2x the target into the candidate list, then emit the
+            // nearest kMeshSelect UNIQUE tris below — deduping only at emission would let each
+            // eye-duplicate burn a selection slot and halve the real constraint coverage.
+            constexpr int kMeshCand = kMeshSelect * 2;
+            Sel sel[kMeshCand];
             int nsel = 0;
             for (int i = 0; i < g_mesh_count[read_side]; i++) {
                 const MeshTri& mt = g_mesh_buf[read_side][i];
@@ -606,10 +612,10 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                         break;
                     }
                 }
-                if (nsel == kMeshSelect && d >= sel[nsel - 1].rank) {
+                if (nsel == kMeshCand && d >= sel[nsel - 1].rank) {
                     continue;
                 }
-                int at = (nsel < kMeshSelect) ? nsel++ : kMeshSelect - 1;
+                int at = (nsel < kMeshCand) ? nsel++ : kMeshCand - 1;
                 while (at > 0 && sel[at - 1].rank > d) {
                     sel[at] = sel[at - 1];
                     at--;
@@ -617,10 +623,13 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                 sel[at] = { d, i };
             }
             g_mesh_dbg_count = 0;
-            for (int s = 0; s < nsel && n_work < (int)(sizeof(raw_prims) / sizeof(raw_prims[0])); s++) {
+            for (int s = 0; s < nsel && g_mesh_dbg_count < kMeshSelect &&
+                            n_work < (int)(sizeof(raw_prims) / sizeof(raw_prims[0]));
+                 s++) {
                 const MeshTri& mt = g_mesh_buf[read_side][sel[s].idx];
-                // Both eyes render (and harvest) the same geometry: drop exact duplicates so
-                // they don't burn selection slots.
+                // Emit unique tris only: the second eye's copy of an already-emitted tri is
+                // skipped here, and the 2x candidate pool above keeps the next-nearest unique
+                // tri available in its place.
                 const V3 cen = mul(add(add(mt.a, mt.b), mt.c), 1.0f / 3.0f);
                 bool dup = false;
                 for (int q = 0; q < g_mesh_dbg_count; q++) {
@@ -1123,8 +1132,13 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
             V3 drot = q_error_vec(sl.tgt_quat, sl.quat);
             const float travel = len(dpos) + len(drot) * blade_len;
             int nsub = (int)(travel / fmaxf(blade_r, 0.002f)) + 1;
-            if (nsub > 8) {
-                nsub = 8;
+            // With swing-through DISABLED nothing else stops a fast blade, so the
+            // substep-per-blade-radius guarantee must hold at any speed or thin walls tunnel;
+            // with it enabled, contacts disengage above the threshold long before 8 substeps
+            // stop being enough.
+            const int max_sub = sl.desc.passthrough_speed_mps > 0.0f ? 8 : 32;
+            if (nsub > max_sub) {
+                nsub = max_sub;
             }
             const float inv = 1.0f / (float)nsub;
             const V3 dpos_step = mul(dpos, inv);
@@ -1146,7 +1160,7 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                 bool dragged = false;
                 for (int c = 0; c < sl.contact_count; c++) {
                     if (sl.contact_pens[c] <= -touch_m) {
-                        continue; // speculative-band entry, not actually touching
+                        continue; // recorded in the touch band but not actually pressing
                     }
                     const V3 cp = sl.contact_pts[c];
                     const V3 n = sl.contact_ns[c];

@@ -205,10 +205,8 @@ void VR_PhysSetObject(int slot, const VrHeldObjectDesc* descOrNull) {
     memcpy(tmp.grip_local_root_m, d.gripLocalRootM, sizeof(float) * 3);
     memcpy(tmp.grip_local_tip_m, d.gripLocalTipM, sizeof(float) * 3);
     tmp.contact_enabled = d.contactEnabled != 0;
-    tmp.restitution = d.restitution;
     tmp.friction = d.friction;
     tmp.blade_radius_m = d.bladeRadiusM;
-    tmp.speculative_m = d.speculativeM;
     tmp.touch_tolerance_m = d.touchToleranceM;
     tmp.max_ang_accel = d.maxAngAccel;
     tmp.pivot_only = d.pivotOnly != 0;
