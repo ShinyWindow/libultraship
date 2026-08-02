@@ -1783,9 +1783,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     // VR physics visual-mesh harvest: capture the triangle in WORLD space before any screen
     // culling — geometry behind the camera or off-screen still physically exists for the
-    // blade. Rect slots carry no world positions, so they never harvest.
-    if (!is_rect && vrphys_mesh_collecting() && vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES &&
-        vtx3_idx < MAX_VERTICES) {
+    // blade. Rect slots carry no world positions, so they never harvest. Depth-write must be
+    // ON: particles, sparks, glows and other ephemera render without Z update, and none of
+    // them should stop a sword.
+    if (!is_rect && vrphys_mesh_collecting() && ((mRdp->other_mode_l & Z_UPD) == Z_UPD) &&
+        vtx1_idx < MAX_VERTICES && vtx2_idx < MAX_VERTICES && vtx3_idx < MAX_VERTICES) {
         vrphys_mesh_consider_tri(v1->world, v2->world, v3->world);
     }
 
@@ -4249,7 +4251,18 @@ bool gfx_set_grayscale_handler_custom(F3DGfx** cmd0) {
 bool gfx_vrphys_mask_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
 
-    vrphys_mesh_mask(cmd->words.w1 != 0);
+    // w1: 0 = unmask, 1 = mask (exclude from harvest), 2 = flesh material on, 3 = flesh off.
+    switch (cmd->words.w1) {
+        case 2:
+            vrphys_mesh_set_flesh(true);
+            break;
+        case 3:
+            vrphys_mesh_set_flesh(false);
+            break;
+        default:
+            vrphys_mesh_mask(cmd->words.w1 != 0);
+            break;
+    }
     return false;
 }
 

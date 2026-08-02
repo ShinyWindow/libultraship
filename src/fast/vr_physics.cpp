@@ -331,6 +331,7 @@ int g_prim_count = 0;
 // finished, and the renderer fills the other side.
 struct MeshTri {
     V3 a, b, c;
+    int id; // material tag: wall by default, flesh while the flesh marker is set
 };
 constexpr int kMeshCap = 4096;
 constexpr int kMeshSelect = 32; // nearest tris fed to the solver each step
@@ -339,6 +340,7 @@ int g_mesh_count[2] = { 0, 0 };
 int g_mesh_write = 0;
 bool g_mesh_enabled = false;
 bool g_mesh_masked = false;
+bool g_mesh_flesh = false;
 V3 g_mesh_center = kV3Zero; // world units
 float g_mesh_radius = 0.0f;
 // The tris actually fed to the solver last step (world units), for the debug overlay.
@@ -570,6 +572,7 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         g_mesh_write ^= 1;
         g_mesh_count[g_mesh_write] = 0;
         g_mesh_masked = false; // never let a lost pop-marker mask a whole frame
+        g_mesh_flesh = false;
         const SlotState& wsl = g_slots[VRPHYS_SLOT_WEAPON];
         if (wsl.active && wsl.state_valid && g_mesh_count[read_side] > 0) {
             const V3 br = raw_to_world(add(wsl.pos_m, qrot(wsl.quat, v3(wsl.desc.grip_local_root_m))));
@@ -637,7 +640,7 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                 rp.b = world_to_raw(mt.b);
                 rp.c = world_to_raw(mt.c);
                 rp.radius_m = 0.0f;
-                rp.id = 1 << 12; // generic wall material
+                rp.id = mt.id; // wall by default, flesh for enemy/NPC body tris
                 g_mesh_dbg[g_mesh_dbg_count++] = mt;
             }
         }
@@ -1479,6 +1482,10 @@ void vrphys_mesh_mask(bool masked) {
     g_mesh_masked = masked;
 }
 
+void vrphys_mesh_set_flesh(bool flesh) {
+    g_mesh_flesh = flesh;
+}
+
 bool vrphys_mesh_collecting() {
     return g_mesh_enabled && !g_mesh_masked;
 }
@@ -1528,7 +1535,7 @@ void vrphys_mesh_consider_tri(const float a[3], const float b[3], const float c[
     if (vdot(n, sub(g_mesh_center, va)) < -back_margin * n_len) {
         return;
     }
-    g_mesh_buf[g_mesh_write][cnt++] = { va, vb, vc };
+    g_mesh_buf[g_mesh_write][cnt++] = { va, vb, vc, g_mesh_flesh ? (3 << 12) : (1 << 12) };
 }
 
 void vrphys_set_contact_prims(const VrPhysContactPrim* prims, int count) {

@@ -137,6 +137,7 @@ int vrphys_get_object_contacts(int slot, float* out_pos_units_xyz, float* out_no
 // player's own hands/weapon, the sword trail).
 void vrphys_mesh_set_region(const float center_units[3], float radius_units, bool enabled);
 void vrphys_mesh_mask(bool masked);
+void vrphys_mesh_set_flesh(bool flesh); // tris harvested while set carry the flesh material id
 bool vrphys_mesh_collecting();
 void vrphys_mesh_consider_tri(const float a[3], const float b[3], const float c[3]);
 // The harvested tris the solver actually used last step (world units, 9 floats per tri).
