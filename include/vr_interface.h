@@ -106,7 +106,7 @@ bool     VR_GetHandMatrix(int hand, float out[4][4]);
 // Contract version of the physical-combat interface between the game and this library. Bump on any
 // breaking change to these types/functions; the game asserts equality at init so a stale submodule
 // build fails loudly instead of subtly misbehaving.
-#define VR_PHYS_INTERFACE_VERSION 12
+#define VR_PHYS_INTERFACE_VERSION 13
 int32_t VR_PhysGetInterfaceVersion(void);
 
 // Latest hand velocity: linear in physical meters/second (independent of world scale and Link's
@@ -199,7 +199,7 @@ int32_t VR_PhysGetMeshDebugTris(float* outXyz9PerTri, int32_t maxTris);
 #define VR_PHYS_PRIM_PLANE 2   // a = point on plane, b = unit normal
 #define VR_PHYS_PRIM_TRI 3     // a,b,c = triangle vertices (BOUNDED — use for level geometry so
                                //   constraints end exactly where the polygon ends: ledges, corners)
-#define VR_PHYS_MAX_CONTACT_PRIMS 24
+#define VR_PHYS_MAX_CONTACT_PRIMS 48
 typedef struct VrContactPrim {
     int type;
     float a[3];

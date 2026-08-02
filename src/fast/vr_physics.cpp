@@ -1028,26 +1028,51 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                                 n = mul(tn, side);
                                 cp = x;
                             } else {
-                                if (pr.type != VRPHYS_PRIM_TRI) {
-                                    continue;
-                                }
                                 const int e = m - kSamples - 1;
-                                const V3 vv[3] = { pr.a, pr.b, pr.c };
-                                V3 pb, pt;
-                                closest_seg_seg(rootNow, tipNow, vv[e], vv[(e + 1) % 3], pb, pt);
-                                const V3 d = sub(pb, pt);
-                                const float dist = len(d);
-                                if (dist < 1e-5f) {
-                                    continue;
+                                if (pr.type != VRPHYS_PRIM_TRI) {
+                                    if (e != 0 ||
+                                        (pr.type != VRPHYS_PRIM_CAPSULE && pr.type != VRPHYS_PRIM_SPHERE)) {
+                                        continue;
+                                    }
+                                    // Continuous closest-pair contact for capsules/spheres: the
+                                    // five point samples leave ~len/4 gaps, and a thin bone
+                                    // capsule (skeleton-fitted enemy limb) slips clean between
+                                    // them. The closest pair between the blade segment and the
+                                    // capsule axis never misses.
+                                    V3 pb, pc2;
+                                    if (pr.type == VRPHYS_PRIM_CAPSULE) {
+                                        closest_seg_seg(rootNow, tipNow, pr.a, pr.b, pb, pc2);
+                                    } else {
+                                        pc2 = pr.a;
+                                        pb = closest_on_seg(pr.a, rootNow, tipNow);
+                                    }
+                                    const V3 d = sub(pb, pc2);
+                                    const float dist = len(d);
+                                    if (dist < 1e-5f) {
+                                        continue;
+                                    }
+                                    pen = (pr.radius_m + blade_r) - dist;
+                                    n = mul(d, 1.0f / dist);
+                                    cp = add(pc2, mul(n, pr.radius_m));
+                                } else {
+                                    const V3 vv[3] = { pr.a, pr.b, pr.c };
+                                    V3 pb, pt;
+                                    closest_seg_seg(rootNow, tipNow, vv[e], vv[(e + 1) % 3], pb, pt);
+                                    const V3 d = sub(pb, pt);
+                                    const float dist = len(d);
+                                    if (dist < 1e-5f) {
+                                        continue;
+                                    }
+                                    n = mul(d, 1.0f / dist);
+                                    // Only outward-facing edge contact: a normal with no
+                                    // component along the face normal would drag the blade
+                                    // through the face.
+                                    if (vdot(n, tn) < 0.02f) {
+                                        continue;
+                                    }
+                                    pen = blade_r - dist;
+                                    cp = pt;
                                 }
-                                n = mul(d, 1.0f / dist);
-                                // Only outward-facing edge contact: a normal with no component
-                                // along the face normal would drag the blade through the face.
-                                if (vdot(n, tn) < 0.02f) {
-                                    continue;
-                                }
-                                pen = blade_r - dist;
-                                cp = pt;
                             }
 
                             if (record && pen > -touch_m) {

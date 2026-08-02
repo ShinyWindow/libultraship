@@ -166,7 +166,7 @@ struct VrPhysContactPrim {
     int id; // opaque game-side tag (kind + material), echoed back in contact events
 };
 
-#define VRPHYS_MAX_CONTACT_PRIMS 24
+#define VRPHYS_MAX_CONTACT_PRIMS 48
 void vrphys_set_contact_prims(const VrPhysContactPrim* prims, int count);
 
 // ---- Blade path + contact events (produced per sim step, drained per game tick) ----
