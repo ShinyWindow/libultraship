@@ -53,6 +53,16 @@ int16_t VR_GetHeadYaw(void);
 int16_t VR_GetHeadingYaw(void);
 void    VR_RecenterHeading(int16_t linkYaw);
 
+// Lock-on framing (Legaiaflame's Lock On). The game pushes the world direction of its lock-on
+// target every tick; the playspace then eases so that direction stays within a deadzone cone of
+// where the player is actually looking. A headset's orientation can never be overridden, so this
+// turns the WORLD under the player instead — the same head-pivot rotation artificial turning uses,
+// applied at headset rate so it glides. Inside the cone nothing happens at all, which is what
+// keeps free look intact; only the excess past it is corrected, and never faster than the
+// configured rate. The request expires shortly after the game stops refreshing it, so a state that
+// never runs the update (cutscene, menu, unload) can't leave the world slowly rotating.
+void VR_SetLockOnYaw(int16_t yawBinang, bool active);
+
 // Camera unification (Phase 3). VR_GetCameraPose returns the rendered HMD pose in game-world coords
 // (eye position + forward/up unit vectors); VR_GetCullingFovy returns a vertical FOV (degrees) wide
 // enough to cover the binocular VR view. The game feeds these into its View so CPU-side systems
@@ -90,6 +100,10 @@ void VR_ClampRoomscaleLean(float max_units);
 // Controller grip pose in game-world coords (eye/anchor frame): pos in game units, quat is x,y,z,w.
 // Returns false (and identity) if that hand isn't tracked. Buttons/sticks/trigger/grip per hand.
 bool     VR_GetHandPose(int hand, float pos[3], float quat[4]);
+// Modal hand gestures (the Alyx-style item selector): while suppressed, a hand's thumbstick
+// reads as centered at the SOURCE — movement, artificial turning and stick C-buttons all
+// inherit it, so holding a stick-click gesture can't steer, turn or fire items.
+void     VR_SetStickSuppressed(int hand, int32_t suppressed);
 // Controller aim ray (runtime-calibrated pointing pose) in game-world coords: origin + unit
 // forward direction. This is the ray for weapon aiming (slingshot/bow/hookshot).
 bool     VR_GetAimRay(int hand, float pos[3], float dir[3]);
@@ -106,7 +120,7 @@ bool     VR_GetHandMatrix(int hand, float out[4][4]);
 // Contract version of the physical-combat interface between the game and this library. Bump on any
 // breaking change to these types/functions; the game asserts equality at init so a stale submodule
 // build fails loudly instead of subtly misbehaving.
-#define VR_PHYS_INTERFACE_VERSION 13
+#define VR_PHYS_INTERFACE_VERSION 14
 int32_t VR_PhysGetInterfaceVersion(void);
 
 // Latest hand velocity: linear in physical meters/second (independent of world scale and Link's
@@ -178,6 +192,10 @@ typedef struct VrHeldObjectDesc {
     float cutDragFlesh;        // resistance while cutting through enemy bodies (0..1 retained
                                // per 90Hz step: 0 = clean cut, ~0.55 = heavy flesh drag)
     float cutDragWorld;        // same, for world geometry the swing passes through
+    float visualLagS;          // cosmetic weight lag: the RENDERED pose trails the hand's
+                               // rotation by this many seconds on fast swings, then snaps back
+                               // with a little overshoot. Physics/damage never lag. <= 0 = off.
+    float visualSnapHz;        // catch-up spring frequency; <= 0.5 uses the built-in 5 Hz
 } VrHeldObjectDesc;
 void VR_PhysSetObject(int slot, const VrHeldObjectDesc* descOrNull);
 
@@ -257,6 +275,9 @@ void     VR_SetHandScale(float s);
 // hand. Axis via gVrHandMirrorAxis.
 void     VR_SetHandMirror(int hand, bool mirror);
 void     VR_RegisterHandMatrix(const void* mtx, int hand);
+// A matrix DERIVED from a hand at 20 Hz (bow/slingshot string): substituted per frame with
+// (live hand pose) x (localMf16, MtxF layout), so it stays welded to the live-rendered hand.
+void     VR_RegisterHandChildMatrix(const void* mtx, int hand, const float* localMf16);
 void     VR_ClearHandMatrices(void);
 
 #ifdef __cplusplus

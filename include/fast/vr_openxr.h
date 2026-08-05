@@ -113,6 +113,9 @@ bool vr_get_aim_ray(int hand, float out_pos[3], float out_dir[3]);
 bool vr_is_hand_active(int hand);
 uint16_t vr_get_controller_buttons(int hand);
 void vr_get_thumbstick(int hand, float* x, float* y);
+// Modal hand gestures (Alyx-style item selector): while suppressed, this hand's thumbstick
+// reads centered at the source — movement, turning and stick C-buttons all inherit it.
+void vr_set_stick_suppressed(int hand, bool suppressed);
 float vr_get_trigger(int hand);
 float vr_get_grip(int hand);
 // One-shot controller vibration through the OpenXR haptic action. amplitude 0..1, freq_hz <= 0 =
@@ -130,11 +133,15 @@ bool vr_get_hand_matrix(int hand, float out[4][4]);
 void vr_set_hand_scale(float s);
 void vr_set_hand_mirror(int hand, bool mirror);
 void vr_register_hand_matrix(const void* mtx, int hand);
+// Hand-CHILD matrix: substituted with (live hand pose) x (local_mf16, MtxF layout) — for
+// geometry derived from the hand at 20 Hz that must track the live hand (bowstring).
+void vr_register_hand_child_matrix(const void* mtx, int hand, const float* local_mf16);
 void vr_clear_hand_matrices();
 bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]);
 
 // HMD-driven heading (Phase 2)
 int16_t vr_get_heading_yaw();
+void vr_set_lockon_yaw(int16_t yaw_binang, bool active);
 void vr_recenter_heading(int16_t link_yaw);
 
 // Sub-frame interpolation factor (0..1) for the current render pass, so the camera anchor can be

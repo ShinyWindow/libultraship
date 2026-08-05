@@ -80,6 +80,10 @@ void VR_RecenterHeading(int16_t linkYaw) {
     vr_recenter_heading(linkYaw);
 }
 
+void VR_SetLockOnYaw(int16_t yawBinang, bool active) {
+    vr_set_lockon_yaw(yawBinang, active);
+}
+
 void VR_GetCameraPose(float eye[3], float fwd[3], float up[3]) {
     vr_get_camera_pose(eye, fwd, up);
 }
@@ -126,6 +130,10 @@ uint16_t VR_GetControllerButton(int hand) {
 
 void VR_GetThumbstick(int hand, float* x, float* y) {
     vr_get_thumbstick(hand, x, y);
+}
+
+void VR_SetStickSuppressed(int hand, int32_t suppressed) {
+    vr_set_stick_suppressed(hand, suppressed != 0);
 }
 
 float VR_GetTrigger(int hand) {
@@ -217,6 +225,8 @@ void VR_PhysSetObject(int slot, const VrHeldObjectDesc* descOrNull) {
     tmp.passthrough_speed_mps = d.passthroughSpeedMps;
     tmp.cut_drag_flesh = d.cutDragFlesh;
     tmp.cut_drag_world = d.cutDragWorld;
+    tmp.visual_lag_s = d.visualLagS;
+    tmp.visual_snap_hz = d.visualSnapHz;
     vrphys_set_object(slot, &tmp);
 }
 
@@ -330,6 +340,10 @@ void VR_SetHandMirror(int hand, bool mirror) {
 
 void VR_RegisterHandMatrix(const void* mtx, int hand) {
     vr_register_hand_matrix(mtx, hand);
+}
+
+void VR_RegisterHandChildMatrix(const void* mtx, int hand, const float* localMf16) {
+    vr_register_hand_child_matrix(mtx, hand, localMf16);
 }
 
 void VR_ClearHandMatrices(void) {

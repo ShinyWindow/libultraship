@@ -372,6 +372,10 @@ static void handle_session_state_change(XrSessionState new_state) {
 
 static void vr_reset_snap_turn(); // defined with the snap-turn state below
 
+// Per-hand thumbstick suppression for modal hand gestures (Alyx-style item selector) —
+// applied at the source in update_input, so every stick consumer inherits it.
+static bool g_stick_suppressed[2] = { false, false };
+
 static void poll_events() {
     XrEventDataBuffer event = { XR_TYPE_EVENT_DATA_BUFFER };
     while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
@@ -616,6 +620,12 @@ static void update_input() {
         } else {
             xr.thumbstick_x[h] = xr.thumbstick_y[h] = 0.0f;
         }
+        // Modal hand gestures (the Alyx-style item selector) suppress a hand's stick at the
+        // SOURCE, so every consumer — movement, artificial turning, stick C-buttons — inherits
+        // it: holding a stick-click gesture cannot steer, turn or fire items.
+        if (g_stick_suppressed[h]) {
+            xr.thumbstick_x[h] = xr.thumbstick_y[h] = 0.0f;
+        }
 
         // Bitmask. Analog trigger/grip are thresholded so they also read as digital buttons.
         uint16_t b = 0;
@@ -656,7 +666,9 @@ static XrPosef apply_turn(const XrPosef& p) {
 // Rotate the world by `degrees_right` (positive = player turns right) about the vertical axis
 // through the player's current head position. Pivoting on the head keeps the player in place —
 // any other pivot would translate them sideways as they turn. Called with this frame's raw views
-// located but not yet turn-adjusted.
+// located but not yet turn-adjusted. Serves BOTH turn styles: one 45-degree call per flick for
+// snap, one sub-degree call per frame for smooth (the pivot re-derives from the live head each
+// call, so continuous turning stays centered on the player).
 static void vr_apply_snap_turn(float degrees_right) {
     const float rad = degrees_right * (3.14159265358979323846f / 180.0f);
     // Right-handed yaw about +Y turns left, so turning right is the negative angle.
@@ -667,6 +679,63 @@ static void vr_apply_snap_turn(float degrees_right) {
     const glm::vec3 pivot = g_turn_rot * raw_center + g_turn_off; // where the head currently appears
     g_turn_rot = glm::normalize(r * g_turn_rot);
     g_turn_off = r * (g_turn_off - pivot) + pivot;
+}
+
+// Lock-on framing request from the game: the world direction of the current lock-on target, and
+// how long the request stays live without a refresh. The game pushes this once per 20 Hz tick, so
+// the TTL only has to outlast a tick or two — it exists so that a game state which stops updating
+// (cutscene, menu, scene unload) can never leave the world creeping around on a stale target.
+static int16_t g_lockon_yaw = 0;
+static float g_lockon_ttl = 0.0f;
+static constexpr float kLockOnTtlSeconds = 0.15f;
+
+// The requested bearing arrives at the 20 Hz game tick but is consumed at headset rate, so it is a
+// STAIRCASE: while circling a target the bearing can sweep ~100 deg/s, which lands as a ~5 degree
+// jump every tick. Chasing that directly is what made the view stutter — the slew limiter ran at
+// full speed for ~40 ms eating each step, then sat still for the rest of the tick. So the input is
+// low-passed into a continuous bearing first, and the tracker below is proportional rather than
+// bang-bang. Together they turn a stepped input into steady motion at the true sweep rate.
+// Invalidated whenever the request drops, so acquiring a new target starts from where you are
+// looking instead of sweeping in from the last target's bearing.
+static float g_lockon_smoothed_deg = 0.0f;
+static bool g_lockon_smooth_valid = false;
+static constexpr float kLockOnInputTau = 0.04f;  // seconds; smooths the 20 Hz staircase
+static constexpr float kLockOnTrackTau = 0.04f;  // seconds; tracker stiffness near the target
+
+// Signed degrees in (-180, 180]. Bearings wrap, and every difference here has to take the short
+// way around or the view would unwind the long way through a heading crossing.
+static float vr_wrap180(float deg) {
+    deg = fmodf(deg + 180.0f, 360.0f);
+    if (deg < 0.0f) {
+        deg += 360.0f;
+    }
+    return deg - 180.0f;
+}
+
+void vr_set_lockon_yaw(int16_t yaw_binang, bool active) {
+    g_lockon_yaw = yaw_binang;
+    g_lockon_ttl = active ? kLockOnTtlSeconds : 0.0f;
+    if (!active) {
+        g_lockon_smooth_valid = false;
+    }
+}
+
+// The heading the player WILL have this frame: the raw HMD forward carried through the turn
+// accumulated so far. vr_get_heading_yaw reads xr.views, which are still raw at the point the turn
+// block runs (apply_turn happens further down), so the turn has to be composed in by hand here.
+// Matches vr_get_heading_yaw's convention exactly, manual offset included, so "the target is dead
+// ahead" means the same thing to the framing code and to Link's steering.
+static bool vr_pending_heading_yaw(int16_t* out) {
+    const XrQuaternionf& q = xr.views[0].pose.orientation;
+    const glm::quat gq = g_turn_rot * glm::quat(q.w, q.x, q.y, q.z);
+    const glm::vec3 fwd = gq * glm::vec3(0.0f, 0.0f, -1.0f);
+    if (fwd.x * fwd.x + fwd.z * fwd.z <= 1e-6f) {
+        return false; // looking straight up or down: heading is degenerate, correct nothing
+    }
+    const float yaw = atan2f(fwd.x, fwd.z);
+    const int16_t manual = static_cast<int16_t>(CVarGetInteger("gVrHeadingManualOffset", 0));
+    *out = static_cast<int16_t>(static_cast<int16_t>(yaw * (32768.0f / 3.14159265358979323846f)) + manual);
+    return true;
 }
 
 // --------------------------------------------------------------------------
@@ -1399,18 +1468,104 @@ bool vr_begin_frame() {
     }
     xr.flat_screen_prev = xr.flat_screen;
 
-    // Snap turn (right stick X): latch a discrete turn on a threshold crossing; the stick must
-    // return to center before the next snap fires. Suspended in flat-screen mode (right stick
-    // navigates menus) and in third person (the stock game owns the camera and the right stick is
-    // pure C-buttons — no artificial rotation exists in that mode).
+    // Artificial turning (right stick X), the two styles every VR title offers: SNAP latches a
+    // discrete turn on a threshold crossing (the stick must return to center before the next
+    // snap fires); SMOOTH yaws continuously at headset rate while the stick is deflected past
+    // the deadzone — analog by default (deflection past the deadzone scales the rate,
+    // re-normalized so full tilt = full speed), constant-rate if preferred. Both run through
+    // the same head-pivot turn accumulation, so the physics sim and every game-facing pose
+    // compose identically. Suspended in flat-screen mode (right stick navigates menus) and in
+    // third person (the stock game owns the camera and the right stick is pure C-buttons).
     if (xr.input_initialized && !xr.flat_screen && xr.first_person && CVarGetInteger("gVrSnapTurnOn", 1)) {
         static int snap_latch = 0;
         const float sx = xr.thumbstick_x[1];
-        if (snap_latch == 0 && fabsf(sx) > 0.6f) {
+        if (CVarGetInteger("gVrTurnStyle", 0) == 1) {
+            const float dead = CVarGetFloat("gVrSmoothTurnDeadzone", 0.25f);
+            const float mag = fabsf(sx);
+            if (mag > dead) {
+                float frac = 1.0f;
+                if (CVarGetInteger("gVrSmoothTurnAnalog", 1)) {
+                    frac = (mag - dead) / (1.0f - dead);
+                }
+                float dt = xr.frame_state.predictedDisplayPeriod > 0
+                               ? (float)((double)xr.frame_state.predictedDisplayPeriod * 1e-9)
+                               : 1.0f / (float)vr_get_refresh_rate();
+                if (dt > 1.0f / 30.0f) {
+                    dt = 1.0f / 30.0f; // a frame hitch must not lurch the world around
+                }
+                vr_apply_snap_turn((sx > 0.0f ? 1.0f : -1.0f) * frac *
+                                   CVarGetFloat("gVrSmoothTurnSpeed", 120.0f) * dt);
+            }
+            snap_latch = 0;
+        } else if (snap_latch == 0 && fabsf(sx) > 0.6f) {
             snap_latch = (sx > 0.0f) ? 1 : -1;
             vr_apply_snap_turn(snap_latch * CVarGetFloat("gVrSnapTurnDegrees", 45.0f));
         } else if (snap_latch != 0 && fabsf(sx) < 0.3f) {
             snap_latch = 0;
+        }
+    }
+
+    // Lock-on framing (Legaiaflame's Lock On): ease the world so the lock-on target stays in front
+    // of the player. Runs AFTER artificial turning so it corrects against the turn the player just
+    // asked for rather than fighting a stale heading. The deadzone is the whole design: inside that
+    // cone the world is left completely alone, so glancing around costs nothing and there is no
+    // constant micro-rotation to make anyone sick; only the excess past the cone is taken out, and
+    // never faster than the configured rate. Yaw only — pitch and roll are the player's alone.
+    if (xr.input_initialized && !xr.flat_screen && xr.first_person && g_lockon_ttl > 0.0f) {
+        float dt = xr.frame_state.predictedDisplayPeriod > 0
+                       ? (float)((double)xr.frame_state.predictedDisplayPeriod * 1e-9)
+                       : 1.0f / (float)vr_get_refresh_rate();
+        if (dt > 1.0f / 30.0f) {
+            dt = 1.0f / 30.0f; // a frame hitch must not lurch the world around
+        }
+        g_lockon_ttl -= dt;
+
+        int16_t heading = 0;
+        if (vr_pending_heading_yaw(&heading)) {
+            // Low-pass the stepped request into a continuous bearing. On the first frame of a lock
+            // it is adopted outright — easing in from a stale bearing would swing the view through
+            // an arc the player never asked for.
+            const float target_deg = (float)g_lockon_yaw * (180.0f / 32768.0f);
+            if (!g_lockon_smooth_valid) {
+                g_lockon_smoothed_deg = target_deg;
+                g_lockon_smooth_valid = true;
+            } else {
+                g_lockon_smoothed_deg = vr_wrap180(
+                    g_lockon_smoothed_deg + vr_wrap180(target_deg - g_lockon_smoothed_deg) *
+                                                (1.0f - expf(-dt / kLockOnInputTau)));
+            }
+
+            const float err_deg =
+                vr_wrap180(g_lockon_smoothed_deg - (float)heading * (180.0f / 32768.0f));
+            const float dead = CVarGetFloat("gVrLockOnDeadzone", 0.0f);
+            float excess = 0.0f;
+            if (err_deg > dead) {
+                excess = err_deg - dead;
+            } else if (err_deg < -dead) {
+                excess = err_deg + dead;
+            }
+            if (excess != 0.0f) {
+                // Slew-limited far away, eased close in. The proportional term is what removes the
+                // stutter: the rotation rate becomes a function of how far off the target is, so a
+                // steadily sweeping bearing produces steady motion instead of full-speed bursts
+                // separated by dead stops. The speed slider stays a hard ceiling, which is what
+                // keeps ACQUIRING a target (a 170 degree error) from whipping the view around.
+                excess *= (1.0f - expf(-dt / kLockOnTrackTau));
+                const float max_step = CVarGetFloat("gVrLockOnTurnSpeed", 120.0f) * dt;
+                if (excess > max_step) {
+                    excess = max_step;
+                } else if (excess < -max_step) {
+                    excess = -max_step;
+                }
+                // NEGATED, and the sign matters more than it looks: vr_apply_snap_turn takes
+                // degrees to the player's RIGHT, and a right turn DECREASES the game's binang yaw
+                // (yaw 0 faces +Z and increases toward +X, which is the player's left in this
+                // frame). Closing a positive error therefore needs a negative right-turn. Get this
+                // backwards and the loop becomes positive feedback: it drives the error away from
+                // zero until it parks at the opposite fixed point, leaving the target exactly
+                // behind the player's head.
+                vr_apply_snap_turn(-excess);
+            }
         }
     }
 
@@ -2138,6 +2293,12 @@ void vr_get_thumbstick(int hand, float* x, float* y) {
     *y = xr.thumbstick_y[hand];
 }
 
+void vr_set_stick_suppressed(int hand, bool suppressed) {
+    if (hand >= 0 && hand <= 1) {
+        g_stick_suppressed[hand] = suppressed;
+    }
+}
+
 float vr_get_trigger(int hand) {
     if (hand < 0 || hand > 1 || !xr.input_initialized) return 0.0f;
     return xr.trigger_value[hand];
@@ -2263,18 +2424,59 @@ void vr_register_hand_matrix(const void* mtx, int hand) {
     if (mtx) g_hand_mtx_registry[mtx] = hand;
 }
 
+// Live hand-CHILD matrices (bow/slingshot string): registered with a hand-LOCAL transform
+// extracted game-side against the same 20 Hz hand snapshot the matrix was built from; lookup
+// returns (live hand pose) x (local), welding derived geometry to the live-rendered hand
+// instead of letting it trail at game rate.
+struct HandChildMtx {
+    int hand;
+    float local[4][4]; // MtxF layout: [column][component]
+};
+static std::unordered_map<const void*, HandChildMtx> g_hand_child_registry;
+
+void vr_register_hand_child_matrix(const void* mtx, int hand, const float* local_mf16) {
+    if (mtx && local_mf16) {
+        HandChildMtx& e = g_hand_child_registry[mtx];
+        e.hand = hand;
+        memcpy(e.local, local_mf16, sizeof(e.local));
+    }
+}
+
 void vr_clear_hand_matrices() {
     g_hand_mtx_registry.clear();
+    g_hand_child_registry.clear();
 }
 
 bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]) {
     // Hot path: gfx_sp_matrix calls this for EVERY G_MTX command, per eye — thousands per frame,
-    // against a registry that holds at most two entries. Skip the hash entirely when it's empty
-    // (which is every command outside Link's two hand limbs, and every frame with hands disabled).
-    if (g_hand_mtx_registry.empty()) return false;
-    auto it = g_hand_mtx_registry.find(mtx);
-    if (it == g_hand_mtx_registry.end()) return false;
-    return vr_get_hand_matrix(it->second, out);
+    // against registries that hold a handful of entries. Skip the hashes entirely when empty
+    // (which is every command outside Link's hands, and every frame with hands disabled).
+    if (!g_hand_mtx_registry.empty()) {
+        auto it = g_hand_mtx_registry.find(mtx);
+        if (it != g_hand_mtx_registry.end()) {
+            return vr_get_hand_matrix(it->second, out);
+        }
+    }
+    if (!g_hand_child_registry.empty()) {
+        auto it = g_hand_child_registry.find(mtx);
+        if (it != g_hand_child_registry.end()) {
+            float hm[4][4];
+            if (!vr_get_hand_matrix(it->second.hand, hm)) {
+                return false;
+            }
+            const float(*l)[4] = it->second.local;
+            // out = hand COMPOSED WITH local (local applied to vertices first). All three
+            // matrices share the MtxF [column][component] layout.
+            for (int c = 0; c < 4; c++) {
+                for (int r = 0; r < 4; r++) {
+                    out[c][r] =
+                        hm[0][r] * l[c][0] + hm[1][r] * l[c][1] + hm[2][r] * l[c][2] + hm[3][r] * l[c][3];
+                }
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 int16_t vr_get_head_yaw() {
@@ -2589,6 +2791,7 @@ void vr_set_hand_scale(float) {}
 void vr_set_hand_mirror(int, bool) {}
 void vr_trigger_haptic(int, float, float, float) {}
 void vr_register_hand_matrix(const void*, int) {}
+void vr_register_hand_child_matrix(const void*, int, const float*) {}
 void vr_clear_hand_matrices() {}
 bool vr_lookup_hand_matrix(const void*, float out[4][4]) {
     for (int r = 0; r < 4; r++)
@@ -2598,6 +2801,7 @@ bool vr_lookup_hand_matrix(const void*, float out[4][4]) {
 }
 int16_t vr_get_head_yaw() { return 0; }
 int16_t vr_get_heading_yaw() { return 0; }
+void vr_set_lockon_yaw(int16_t, bool) {}
 void vr_recenter_heading(int16_t) {}
 void vr_set_interp_alpha(float) {}
 void vr_rebind_current_eye_target() {}

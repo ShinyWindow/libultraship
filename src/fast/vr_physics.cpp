@@ -302,6 +302,12 @@ struct SlotState {
     V3 tgt_vel_mps;
     Q4 tgt_quat;
     V3 tgt_ang_vel_rps;
+    // Cosmetic weight-lag ("Ancient Dungeon wiggle"): a raw-space axis-angle offset applied to
+    // the SERVED (rendered) pose only — vrphys_get_hand_sim_pose_raw. It trails the hand's
+    // angular velocity during fast swings and snaps back with a slightly underdamped spring.
+    // Physics never sees it: contacts, the blade ring and every solver read use sl.quat.
+    V3 vis_off;
+    V3 vis_off_vel;
     // Contact + output state
     bool in_contact;
     bool passthrough; // fast-swing state: contacts disengaged until the swing slows down
@@ -671,6 +677,8 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
             // Untracked hand: hold pose, bleed velocity so the object doesn't drift away.
             sl.vel_mps = mul(sl.vel_mps, 0.9f);
             sl.ang_vel_rps = mul(sl.ang_vel_rps, 0.9f);
+            sl.vis_off = mul(sl.vis_off, 0.9f);
+            sl.vis_off_vel = kV3Zero;
             continue;
         }
         const V3 target_pos = h.prev_pos_m; // latest raw sample
@@ -686,6 +694,7 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
             sl.vel_mps = sl.tgt_vel_mps = target_vel;
             sl.quat = sl.tgt_quat = qnorm(target_quat);
             sl.ang_vel_rps = sl.tgt_ang_vel_rps = kV3Zero;
+            sl.vis_off = sl.vis_off_vel = kV3Zero;
             continue;
         }
 
@@ -1228,6 +1237,37 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         sl.vel_mps = mul(sub(sl.pos_m, prev_pos), 1.0f / dt_s);
         sl.ang_vel_rps = mul(q_error_vec(sl.quat, prev_quat), 1.0f / dt_s);
 
+        // ---- Cosmetic weight lag (the Ancient Dungeon trick) ----
+        // The RENDERED pose trails the hand's rotation by visual_lag_s seconds during a fast
+        // swing and snaps back through a slightly underdamped spring — the little overshoot
+        // when the swing stops IS the "weight wiggle". Purely visual: the offset is applied
+        // only in vrphys_get_hand_sim_pose_raw (the served/rendered pose); contacts, the
+        // blade ring and damage all live on sl.quat and never lag. At rest the offset decays
+        // to exactly zero, so the sword stays parented to the hand.
+        if (sl.desc.visual_lag_s > 0.0f) {
+            V3 tgt = mul(h.pend_ang_vel, -sl.desc.visual_lag_s);
+            constexpr float kVisOffCap = 0.4f; // rad — a lag pose, not a detached sword
+            const float tm = len(tgt);
+            if (tm > kVisOffCap) {
+                tgt = mul(tgt, kVisOffCap / tm);
+            }
+            const float w0 =
+                kTwoPi * (sl.desc.visual_snap_hz > 0.5f ? sl.desc.visual_snap_hz : 5.0f);
+            constexpr float kVisZeta = 0.55f; // underdamped on purpose: the overshoot sells it
+            // Semi-implicit Euler: stable for w0*dt <= 2 (snap <= ~20 Hz at 72 Hz refresh).
+            const V3 acc = sub(mul(sub(tgt, sl.vis_off), w0 * w0),
+                               mul(sl.vis_off_vel, 2.0f * kVisZeta * w0));
+            sl.vis_off_vel = add(sl.vis_off_vel, mul(acc, dt_s));
+            sl.vis_off = add(sl.vis_off, mul(sl.vis_off_vel, dt_s));
+            const float om = len(sl.vis_off);
+            if (om > kVisOffCap) {
+                sl.vis_off = mul(sl.vis_off, kVisOffCap / om);
+            }
+        } else {
+            sl.vis_off = kV3Zero;
+            sl.vis_off_vel = kV3Zero;
+        }
+
         // Impact strength = how much of the motion the surface actually refused this step.
         if (ntouch > 0) {
             if (sl.desc.pivot_only) {
@@ -1496,7 +1536,18 @@ bool vrphys_get_hand_sim_pose_raw(int hand, float out_pos_m[3], float out_quat_x
     for (const SlotState& sl : g_slots) {
         if (sl.active && sl.state_valid && sl.desc.primary_hand == hand) {
             v3_store(sl.pos_m, out_pos_m);
-            q4_store(sl.quat, out_quat_xyzw);
+            // Cosmetic weight lag rides ONLY this served pose (rotation about the grip, raw
+            // frame): the rendered sword trails and wiggles, physics stays on sl.quat.
+            const float om = len(sl.vis_off);
+            if (om > 1e-5f) {
+                const float half = om * 0.5f;
+                const float s = sinf(half) / om;
+                const Q4 offq = { sl.vis_off.x * s, sl.vis_off.y * s, sl.vis_off.z * s,
+                                  cosf(half) };
+                q4_store(qnorm(qmul(offq, sl.quat)), out_quat_xyzw);
+            } else {
+                q4_store(sl.quat, out_quat_xyzw);
+            }
             return true;
         }
     }

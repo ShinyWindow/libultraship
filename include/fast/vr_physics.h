@@ -105,6 +105,11 @@ struct VrPhysObjectDesc {
     // and catches up on exit. Separate coefficients for enemy bodies and world geometry.
     float cut_drag_flesh;
     float cut_drag_world;
+    // Cosmetic weight lag: the SERVED (rendered) pose trails the hand's rotation by this many
+    // seconds during fast swings and snaps back slightly underdamped — the "weight wiggle".
+    // Physics, contacts and damage never lag; at rest the offset is exactly zero. <= 0 = off.
+    float visual_lag_s;
+    float visual_snap_hz; // catch-up spring frequency; <= 0.5 uses the built-in 5 Hz
 };
 
 void vrphys_set_object(int slot, const VrPhysObjectDesc* desc_or_null);
