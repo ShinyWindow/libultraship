@@ -1,6 +1,7 @@
 #include "fast/Fast3dGui.h"
 
 #include "fast/Fast3dWindow.h"
+#include "fast/vr_openxr.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
 #include "fast/backends/gfx_metal.h"
@@ -419,6 +420,20 @@ void Fast3dGui::DrawGame() {
         ImGui::SetCursorPos(pos);
         ImGui::Image(reinterpret_cast<ImTextureID>(fb), size);
     }
+
+#ifdef ENABLE_DX11
+    // In VR the main framebuffer is the desktop mirror of the left eye.
+    // Draw the separately copied HUD swapchain over it as a flat 2D layer so
+    // the companion window has a readable HUD independent of the in-headset
+    // world/hand-locked HUD placement.
+    if (mImpl.Backend == WindowBackend::FAST3D_DXGI_DX11) {
+        void* hudMirror = vr_get_hud_mirror_texture_id();
+        if (hudMirror != nullptr) {
+            ImGui::SetCursorPos(pos);
+            ImGui::Image(reinterpret_cast<ImTextureID>(hudMirror), size);
+        }
+    }
+#endif
 
     ImGui::End();
 }
