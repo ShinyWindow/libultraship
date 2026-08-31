@@ -1,12 +1,12 @@
 ﻿#define NOMINMAX
 
 #include "fast/vr_openxr.h"
+#include <cstring>
 
 #ifdef ENABLE_DX11
 
 #include <vector>
 #include <string>
-#include <cstring>
 #include <cmath>
 #include <chrono>
 #include <unordered_map>
