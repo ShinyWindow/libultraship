@@ -1,12 +1,12 @@
 ﻿#define NOMINMAX
 
 #include "fast/vr_openxr.h"
+#include <cstring>
 
 #ifdef ENABLE_DX11
 
 #include <vector>
 #include <string>
-#include <cstring>
 #include <cmath>
 #include <chrono>
 #include <unordered_map>
@@ -243,6 +243,11 @@ static struct {
     // copied here each frame while still acquired.
     ComPtr<ID3D11Texture2D> mirror_texture;
     ComPtr<ID3D11ShaderResourceView> mirror_srv;
+
+    // Desktop HUD mirror: a copy of the HUD swapchain image for compositing
+    // as a flat 2D overlay in the companion window.
+    ComPtr<ID3D11Texture2D> hud_mirror_texture;
+    ComPtr<ID3D11ShaderResourceView> hud_mirror_srv;
 
     // D3D11 cached pointers
     ID3D11Device* d3d_device;
@@ -1140,7 +1145,42 @@ bool vr_init() {
         }
         spdlog::info("[VR] HUD swapchain: {}x{}, {} images", sc.width, sc.height, image_count);
     }
+    // --- Create desktop HUD mirror texture (flat 2D copy for companion window) ---
+    {
+        const auto& hud = xr.hud_swapchain;
 
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = hud.width;
+        desc.Height = hud.height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = view_format;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        HRESULT hr = xr.d3d_device->CreateTexture2D(
+            &desc, nullptr, xr.hud_mirror_texture.ReleaseAndGetAddressOf());
+
+        if (SUCCEEDED(hr)) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+            srv_desc.Format = view_format;
+            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srv_desc.Texture2D.MipLevels = 1;
+
+            hr = xr.d3d_device->CreateShaderResourceView(
+                xr.hud_mirror_texture.Get(), &srv_desc,
+                xr.hud_mirror_srv.ReleaseAndGetAddressOf());
+        }
+
+        if (FAILED(hr)) {
+            spdlog::warn("[VR] Failed to create desktop HUD mirror texture");
+            xr.hud_mirror_texture.Reset();
+            xr.hud_mirror_srv.Reset();
+        } else {
+            spdlog::info("[VR] Desktop HUD mirror texture: {}x{}", hud.width, hud.height);
+        }
+    }
     // --- Create flat-screen swapchain (whole-frame panel for 2D contexts: file select, pause) ---
     {
         auto& sc = xr.screen_swapchain;
@@ -1242,6 +1282,8 @@ void vr_shutdown() {
 
     xr.mirror_srv.Reset();
     xr.mirror_texture.Reset();
+    xr.hud_mirror_srv.Reset();
+    xr.hud_mirror_texture.Reset();
     if (xr.view_space != XR_NULL_HANDLE) {
         xrDestroySpace(xr.view_space);
         xr.view_space = XR_NULL_HANDLE;
@@ -2611,6 +2653,16 @@ void vr_end_hud() {
     if (!xr.initialized) return;
     xr.rendering_hud = false;
 
+    // Copy the completed HUD while its OpenXR swapchain image is still acquired.
+    // The runtime owns the image again after xrReleaseSwapchainImage().
+    auto& sc = xr.hud_swapchain;
+    if (xr.hud_mirror_texture && xr.hud_image_index < sc.images.size()) {
+        ID3D11Texture2D* src = sc.images[xr.hud_image_index].texture;
+        if (src) {
+            xr.d3d_context->CopyResource(xr.hud_mirror_texture.Get(), src);
+        }
+    }
+
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(xr.hud_swapchain.handle, &release_info), "xrReleaseSwapchainImage (HUD)");
 
@@ -2715,6 +2767,9 @@ void vr_capture_mirror() {
 void* vr_get_mirror_texture_id() {
     return xr.mirror_srv.Get();
 }
+void* vr_get_hud_mirror_texture_id() {
+    return xr.hud_mirror_srv.Get();
+}
 
 #else // !ENABLE_DX11
 
@@ -2779,6 +2834,7 @@ bool vr_get_hand_pose(int, float out_pos[3], float out_quat[4]) {
 bool vr_is_hand_active(int) { return false; }
 uint16_t vr_get_controller_buttons(int) { return 0; }
 void vr_get_thumbstick(int, float* x, float* y) { *x = *y = 0.0f; }
+void vr_set_stick_suppressed(int, bool) {}
 float vr_get_trigger(int) { return 0.0f; }
 float vr_get_grip(int) { return 0.0f; }
 bool vr_get_hand_matrix(int, float out[4][4]) {
@@ -2818,5 +2874,6 @@ void vr_end_screen() {}
 void vr_get_2d_target_size(uint32_t* w, uint32_t* h) { *w = 1024; *h = 768; }
 void vr_capture_mirror() {}
 void* vr_get_mirror_texture_id() { return nullptr; }
+void* vr_get_hud_mirror_texture_id() { return nullptr; }
 
 #endif

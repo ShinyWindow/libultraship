@@ -174,3 +174,4 @@ void vr_get_2d_target_size(uint32_t* w, uint32_t* h);
 // mirror isn't available.
 void vr_capture_mirror();
 void* vr_get_mirror_texture_id();
+void* vr_get_hud_mirror_texture_id();
