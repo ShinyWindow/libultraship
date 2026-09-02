@@ -2834,6 +2834,7 @@ bool vr_get_hand_pose(int, float out_pos[3], float out_quat[4]) {
 bool vr_is_hand_active(int) { return false; }
 uint16_t vr_get_controller_buttons(int) { return 0; }
 void vr_get_thumbstick(int, float* x, float* y) { *x = *y = 0.0f; }
+void vr_set_stick_suppressed(int, bool) {}
 float vr_get_trigger(int) { return 0.0f; }
 float vr_get_grip(int) { return 0.0f; }
 bool vr_get_hand_matrix(int, float out[4][4]) {
